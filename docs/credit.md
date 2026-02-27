@@ -17,6 +17,15 @@ Stored in persistent storage keyed by the borrower's address.
 | `interest_rate_bps` | `u32` | Annual interest rate in basis points (e.g. 300 = 3%) |
 | `risk_score` | `u32` | Risk score assigned by the risk engine (0–100) |
 | `status` | `CreditStatus` | Current status of the credit line |
+| `last_rate_update_ts` | `u64` | Ledger timestamp of the last interest-rate change (0 = never updated) |
+
+### `RateChangeConfig`
+Stored in instance storage under the `"rate_cfg"` key. Optional — when absent, no rate-change limits are enforced (backward-compatible).
+
+| Field | Type | Description |
+|---|---|---|
+| `max_rate_change_bps` | `u32` | Maximum absolute change in `interest_rate_bps` allowed per update |
+| `rate_change_min_interval` | `u64` | Minimum elapsed seconds between consecutive rate changes |
 
 ### `CreditStatus`
 
@@ -87,6 +96,7 @@ Draw funds from an active credit line. Requires status **Active**; reverts if st
 | `amount` | `i128` | Amount to draw |
 
 Emits: `("credit", "draw")` and drawn event. Transfers protocol token from reserve to borrower.
+Draw funds from an active credit line. Verifies limit, updates utilized amount, and transfers the protocol token from the contract reserve to the borrower. Caller must be the borrower and must authorize.
 
 ---
 
@@ -99,13 +109,26 @@ Repay drawn funds. Allowed when status is **Active**, **Suspended**, or **Defaul
 | `amount` | `i128` | Amount to repay |
 
 Emits: `("credit", "repay")` event. Reduces `utilized_amount` (capped at zero).
+Repay drawn funds. The borrower must transfer the repayment amount from their account to the contract reserve via the Stellar token contract. The transfer is executed before any state change; if the transfer fails (e.g. insufficient balance or missing authorization), the call reverts and `utilized_amount` is unchanged. The amount applied is capped at the current utilized amount.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `borrower` | `Address` | Borrower (must authorize the call and token transfer) |
+| `amount` | `i128` | Nominal repayment; effective transfer is min(amount, utilized_amount) |
+
+Emits: `("credit", "repay")` with `RepaymentEvent` (borrower, amount actually transferred, new utilized amount, timestamp).
 
 ---
 
-### `update_risk_parameters(env, borrower, credit_limit, interest_rate_bps, risk_score)`
+### `update_risk_parameters(env, borrower, interest_rate_bps, risk_score)`
 Update the risk parameters for an existing credit line. Called by admin or risk engine.
 
-> ⚠️ Not yet implemented — placeholder for future logic.
+When a `RateChangeConfig` is set:
+- The absolute delta between the current and new `interest_rate_bps` must be ≤ `max_rate_change_bps`.
+- If `last_rate_update_ts > 0`, the elapsed time since the last change must be ≥ `rate_change_min_interval`.
+- If the rate is unchanged, both checks are skipped.
+
+Panics with `"rate change exceeds maximum allowed delta"` or `"rate change too soon: minimum interval not elapsed"` on violation.
 
 ---
 
@@ -138,6 +161,18 @@ Reinstates a defaulted credit line to Active. Admin only. Allowed only when stat
 
 Panics if the credit line does not exist or status is not Defaulted.  
 Emits: `("credit", "reinstate")` event.
+### `set_rate_change_limits(env, max_rate_change_bps, rate_change_min_interval)`
+Sets the global rate-change limits. Admin-only.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `max_rate_change_bps` | `u32` | Maximum BPS delta per update |
+| `rate_change_min_interval` | `u64` | Minimum seconds between rate changes |
+
+---
+
+### `get_rate_change_limits(env) -> RateChangeConfig`
+Returns the current `RateChangeConfig`. Panics if none is set.
 
 ---
 
@@ -151,6 +186,7 @@ Returns the credit line data for a borrower, or `None` if not found. View functi
 | Topic | Event Type Symbol | Emitted By | Description |
 |---|---|---|---|
 | `("credit", "opened")` | `opened` | `open_credit_line` | New credit line opened |
+| `("credit", "repay")` | `repay` | `repay_credit` | Repayment (borrower, amount, new utilized, timestamp) |
 | `("credit", "suspend")` | `suspend` | `suspend_credit_line` | Credit line suspended |
 | `("credit", "closed")` | `closed` | `close_credit_line` | Credit line closed |
 | `("credit", "default")` | `default` | `default_credit_line` | Credit line defaulted |
@@ -171,6 +207,8 @@ Returns the credit line data for a borrower, or `None` if not found. View functi
 | `close_credit_line` | Admin or borrower |
 | `default_credit_line` | Admin |
 | `reinstate_credit_line` | Admin |
+| `set_rate_change_limits` | Admin |
+| `get_rate_change_limits` | Anyone (view) |
 | `get_credit_line` | Anyone (view) |
 
 > Note: On-chain authorization via `require_auth()` is not yet enforced in all functions. This is planned for a future release.
@@ -193,6 +231,7 @@ Interest accrual logic is not yet implemented (`repay_credit` is a placeholder).
 |---|---|---|
 | `"admin"` | Instance | `Address` |
 | `borrower: Address` | Persistent | `CreditLineData` |
+| `"rate_cfg"` | Instance | `RateChangeConfig` |
 
 ---
 
