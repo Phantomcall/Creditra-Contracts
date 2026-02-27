@@ -33,8 +33,20 @@ Stored in instance storage under the `"rate_cfg"` key. Optional — when absent,
 |---|---|---|
 | `Active` | 0 | Credit line is open and available |
 | `Suspended` | 1 | Credit line is temporarily suspended |
-| `Defaulted` | 2 | Borrower has defaulted |
+| `Defaulted` | 2 | Borrower has defaulted; draw disabled, repay allowed |
 | `Closed` | 3 | Credit line has been closed |
+
+### Status transitions
+
+| From | To | Trigger |
+|------|-----|--------|
+| Active | Defaulted | Admin calls `default_credit_line` (e.g. after past-due or oracle signal). |
+| Suspended | Defaulted | Admin calls `default_credit_line`. |
+| Defaulted | Active | Admin calls `reinstate_credit_line`. |
+| Defaulted | Suspended | Admin calls `suspend_credit_line`. |
+| Defaulted | Closed | Admin or borrower (when `utilized_amount == 0`) calls `close_credit_line`. |
+
+When status is **Defaulted**: `draw_credit` is disabled; `repay_credit` is allowed.
 
 ### `CreditLineEvent`
 Emitted on every lifecycle state change.
@@ -76,11 +88,27 @@ Emits: `("credit", "opened")` event.
 ---
 
 ### `draw_credit(env, borrower, amount)`
+Draw funds from an active credit line. Requires status **Active**; reverts if status is Suspended, Defaulted, or Closed.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `borrower` | `Address` | Borrower's address |
+| `amount` | `i128` | Amount to draw |
+
+Emits: `("credit", "draw")` and drawn event. Transfers protocol token from reserve to borrower.
 Draw funds from an active credit line. Verifies limit, updates utilized amount, and transfers the protocol token from the contract reserve to the borrower. Caller must be the borrower and must authorize.
 
 ---
 
 ### `repay_credit(env, borrower, amount)`
+Repay drawn funds. Allowed when status is **Active**, **Suspended**, or **Defaulted**. Reverts if credit line does not exist, is Closed, or borrower has not authorized.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `borrower` | `Address` | Borrower's address |
+| `amount` | `i128` | Amount to repay |
+
+Emits: `("credit", "repay")` event. Reduces `utilized_amount` (capped at zero).
 Repay drawn funds. The borrower must transfer the repayment amount from their account to the contract reserve via the Stellar token contract. The transfer is executed before any state change; if the transfer fails (e.g. insufficient balance or missing authorization), the call reverts and `utilized_amount` is unchanged. The amount applied is capped at the current utilized amount.
 
 | Parameter | Type | Description |
@@ -112,8 +140,8 @@ Emits: `("credit", "suspend")` event.
 
 ---
 
-### `close_credit_line(env, borrower)`
-Closes a credit line. Can be called by admin or borrower when `utilized_amount` is 0.
+### `close_credit_line(env, borrower, closer)`
+Closes a credit line. Can be called by admin (force-close) or by borrower when `utilized_amount` is 0. Allowed from Active, Suspended, or Defaulted.
 
 Panics if the credit line does not exist.  
 Emits: `("credit", "closed")` event.
@@ -121,13 +149,18 @@ Emits: `("credit", "closed")` event.
 ---
 
 ### `default_credit_line(env, borrower)`
-Marks a credit line as defaulted. Called by admin.
+Marks a credit line as defaulted. Called by admin when the line is past due or when an oracle/off-chain signal indicates default. Transition: Active or Suspended → Defaulted. After this, `draw_credit` is disabled and `repay_credit` remains allowed.
 
 Panics if the credit line does not exist.  
 Emits: `("credit", "default")` event.
 
 ---
 
+### `reinstate_credit_line(env, borrower)`
+Reinstates a defaulted credit line to Active. Admin only. Allowed only when status is Defaulted. Transition: Defaulted → Active.
+
+Panics if the credit line does not exist or status is not Defaulted.  
+Emits: `("credit", "reinstate")` event.
 ### `set_rate_change_limits(env, max_rate_change_bps, rate_change_min_interval)`
 Sets the global rate-change limits. Admin-only.
 
@@ -157,6 +190,7 @@ Returns the credit line data for a borrower, or `None` if not found. View functi
 | `("credit", "suspend")` | `suspend` | `suspend_credit_line` | Credit line suspended |
 | `("credit", "closed")` | `closed` | `close_credit_line` | Credit line closed |
 | `("credit", "default")` | `default` | `default_credit_line` | Credit line defaulted |
+| `("credit", "reinstate")` | `reinstate` | `reinstate_credit_line` | Credit line reinstated to Active |
 
 ---
 
@@ -172,6 +206,7 @@ Returns the credit line data for a borrower, or `None` if not found. View functi
 | `suspend_credit_line` | Admin |
 | `close_credit_line` | Admin or borrower |
 | `default_credit_line` | Admin |
+| `reinstate_credit_line` | Admin |
 | `set_rate_change_limits` | Admin |
 | `get_rate_change_limits` | Anyone (view) |
 | `get_credit_line` | Anyone (view) |
@@ -252,6 +287,7 @@ soroban contract invoke \
 soroban contract invoke --id <contract-id> --source <admin-keypair> --network testnet -- suspend_credit_line --borrower <borrower-address>
 soroban contract invoke --id <contract-id> --source <admin-keypair> --network testnet -- close_credit_line --borrower <borrower-address>
 soroban contract invoke --id <contract-id> --source <admin-keypair> --network testnet -- default_credit_line --borrower <borrower-address>
+soroban contract invoke --id <contract-id> --source <admin-keypair> --network testnet -- reinstate_credit_line --borrower <borrower-address>
 ```
 
 ---
