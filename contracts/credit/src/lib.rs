@@ -208,7 +208,6 @@ impl Credit {
         );
     }
 
-
     /// Update risk parameters for an existing credit line.
     ///
     /// Called by admin or risk engine when a borrower's risk profile changes.
@@ -1739,7 +1738,57 @@ mod test {
     }
 
     #[test]
-    fn test_event_lifecycle_sequence() {}
+    fn test_event_lifecycle_sequence() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{TryFromVal, TryIntoVal};
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.draw_credit(&borrower, &200_i128);
+        client.repay_credit(&borrower, &50_i128);
+        client.suspend_credit_line(&borrower);
+        client.default_credit_line(&borrower);
+        client.reinstate_credit_line(&borrower);
+        client.close_credit_line(&borrower, &admin);
+
+        let events = env.events().all();
+        assert!(!events.is_empty());
+
+        let (_contract, topics, data) = events.last().unwrap();
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+            symbol_short!("closed")
+        );
+        let event_data: CreditLineEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event_data.status, CreditStatus::Closed);
+        assert_eq!(event_data.borrower, borrower);
+    }
+
+    #[test]
+    fn test_rate_change_limits_roundtrip() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.set_rate_change_limits(&250_u32, &3600_u64);
+
+        let cfg = client.get_rate_change_limits().unwrap();
+        assert_eq!(cfg.max_rate_change_bps, 250);
+        assert_eq!(cfg.rate_change_min_interval, 3600);
+    }
+
     #[test]
     #[should_panic(expected = "interest_rate_bps exceeds maximum")]
     fn test_update_risk_parameters_interest_rate_exceeds_max() {
