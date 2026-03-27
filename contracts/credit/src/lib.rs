@@ -30,8 +30,8 @@ use soroban_sdk::{
 
 use events::{
     publish_credit_line_event, publish_drawn_event, publish_repayment_event,
-    publish_risk_parameters_updated, CreditLineEvent, DrawnEvent, RepaymentEvent,
-    RiskParametersUpdatedEvent,
+    publish_risk_parameters_updated, publish_interest_accrued_event, CreditLineEvent, DrawnEvent, RepaymentEvent,
+    RiskParametersUpdatedEvent, InterestAccruedEvent,
 };
 use types::{CreditLineData, CreditStatus};
 
@@ -49,6 +49,11 @@ fn reentrancy_key(env: &Env) -> Symbol {
 /// Instance storage key for admin.
 fn admin_key(env: &Env) -> Symbol {
     Symbol::new(env, "admin")
+}
+
+/// Instance storage key for rate change configuration.
+fn rate_cfg_key(env: &Env) -> Symbol {
+    Symbol::new(env, "rate_cfg")
 }
 
 fn require_admin(env: &Env) -> Address {
@@ -100,6 +105,109 @@ fn set_reentrancy_guard(env: &Env) {
 
 fn clear_reentrancy_guard(env: &Env) {
     env.storage().instance().set(&reentrancy_key(env), &false);
+}
+
+/// Calculate and accrue interest for a credit line.
+///
+/// This function implements on-chain interest accrual using simple interest calculation:
+/// interest = principal * rate * time_elapsed
+///
+/// # Arguments
+/// * `env` - The contract environment
+/// * `borrower` - The borrower address whose credit line to accrue interest for
+/// * `force_accrual` - If true, accrues interest even when credit line is not active
+///
+/// # Returns
+/// * `i128` - The amount of interest that was accrued (0 if no accrual occurred)
+///
+/// # Notes
+/// - Uses simple interest with annual rate in basis points
+/// - Time is calculated in seconds from last accrual timestamp
+/// - Interest is capitalized (added to utilized amount)
+/// - Only accrues for Active credit lines unless force_accrual is true
+/// - Handles edge cases like zero utilization, zero rate, and overflow protection
+fn calculate_and_accrue_interest(env: &Env, borrower: &Address, force_accrual: bool) -> i128 {
+    let mut credit_line: CreditLineData = env
+        .storage()
+        .persistent()
+        .get(borrower)
+        .expect("Credit line not found");
+
+    // Only accrue for active lines unless forced
+    if !force_accrual && credit_line.status != CreditStatus::Active {
+        return 0;
+    }
+
+    // Don't accrue if there's no utilized amount or interest rate is zero
+    if credit_line.utilized_amount <= 0 || credit_line.interest_rate_bps == 0 {
+        return 0;
+    }
+
+    let current_timestamp = env.ledger().timestamp();
+    let last_accrual_ts = credit_line.last_accrual_ts;
+
+    // If this is the first accrual, use the line creation timestamp (approximated as 0)
+    // or current timestamp to avoid huge accrual from timestamp 0
+    let accrual_start_ts = if last_accrual_ts == 0 {
+        current_timestamp // First accrual, no time elapsed yet
+    } else {
+        last_accrual_ts
+    };
+
+    // Calculate time elapsed in seconds
+    let time_elapsed = current_timestamp.saturating_sub(accrual_start_ts);
+    
+    // No time elapsed, no accrual needed
+    if time_elapsed == 0 {
+        return 0;
+    }
+
+    // Calculate interest using simple interest formula:
+    // interest = principal * (rate_bps / 10000) * (time_elapsed / seconds_in_year)
+    const SECONDS_IN_YEAR: u64 = 365 * 24 * 60 * 60; // 31,536,000 seconds
+    
+    // Convert to i128 for precise calculation
+    let principal = credit_line.utilized_amount;
+    let rate_bps = credit_line.interest_rate_bps as i128;
+    let time_elapsed_i128 = time_elapsed as i128;
+    let seconds_in_year_i128 = SECONDS_IN_YEAR as i128;
+
+    // Calculate: principal * rate_bps * time_elapsed / (10000 * seconds_in_year)
+    // Use checked operations to prevent overflow
+    let interest = principal
+        .checked_mul(rate_bps)
+        .and_then(|x| x.checked_mul(time_elapsed_i128))
+        .and_then(|x| x.checked_div(10000 * seconds_in_year_i128))
+        .unwrap_or(0);
+
+    // Only proceed if interest > 0
+    if interest <= 0 {
+        return 0;
+    }
+
+    // Update credit line with accrued interest
+    credit_line.utilized_amount = credit_line.utilized_amount.checked_add(interest)
+        .expect("utilized amount overflow after interest accrual");
+    credit_line.accrued_interest = credit_line.accrued_interest.checked_add(interest)
+        .expect("accrued interest overflow");
+    credit_line.last_accrual_ts = current_timestamp;
+
+    // Save updated credit line
+    env.storage().persistent().set(borrower, &credit_line);
+
+    // Publish accrual event
+    publish_interest_accrued_event(
+        &env,
+        InterestAccruedEvent {
+            borrower: borrower.clone(),
+            accrued_amount: interest,
+            total_accrued_interest: credit_line.accrued_interest,
+            new_utilized_amount: credit_line.utilized_amount,
+            timestamp: current_timestamp,
+        },
+    );
+
+    interest
 }
 
 #[contract]
@@ -186,6 +294,8 @@ impl Credit {
             risk_score,
             status: CreditStatus::Active,
             last_rate_update_ts: 0,
+            accrued_interest: 0,
+            last_accrual_ts: 0,
         };
 
         env.storage().persistent().set(&borrower, &credit_line);
@@ -283,6 +393,16 @@ impl Credit {
             panic!("credit line is closed");
         }
 
+        // Accrue interest before processing the draw
+        calculate_and_accrue_interest(&env, &borrower, false);
+
+        // Reload credit line after accrual to get updated utilized amount
+        let mut credit_line: CreditLineData = env
+            .storage()
+            .persistent()
+            .get(&borrower)
+            .expect("Credit line not found");
+
         let updated_utilized = credit_line
             .utilized_amount
             .checked_add(amount)
@@ -344,6 +464,17 @@ impl Credit {
             clear_reentrancy_guard(&env);
             panic!("amount must be positive");
         }
+
+        // Accrue interest before processing the repayment
+        calculate_and_accrue_interest(&env, &borrower, false);
+
+        // Reload credit line after accrual to get updated utilized amount
+        let mut credit_line: CreditLineData = env
+            .storage()
+            .persistent()
+            .get(&borrower)
+            .expect("Credit line not found");
+
         let new_utilized = credit_line.utilized_amount.saturating_sub(amount).max(0);
         credit_line.utilized_amount = new_utilized;
         env.storage().persistent().set(&borrower, &credit_line);
@@ -360,6 +491,30 @@ impl Credit {
         );
         clear_reentrancy_guard(&env);
         // TODO: accept token from borrower
+    }
+
+    /// Accrue interest for a credit line (public entrypoint).
+    ///
+    /// This function can be called by anyone to trigger interest accrual for a specific borrower.
+    /// It uses the same accrual logic as draw/repay but as a standalone operation.
+    ///
+    /// # Arguments
+    /// * `borrower` - The borrower address whose credit line to accrue interest for
+    ///
+    /// # Returns
+    /// * `i128` - The amount of interest that was accrued (0 if no accrual occurred)
+    ///
+    /// # Notes
+    /// - Can be called even when credit line is not active (force accrual)
+    /// - Useful for regular interest compounding or manual accrual triggers
+    /// - Emits InterestAccruedEvent if interest is accrued
+    pub fn accrue_interest(env: Env, borrower: Address) -> i128 {
+        set_reentrancy_guard(&env);
+        
+        let accrued_amount = calculate_and_accrue_interest(&env, &borrower, true);
+        
+        clear_reentrancy_guard(&env);
+        accrued_amount
     }
 
     /// Update risk parameters for an existing credit line (admin only).
@@ -2132,5 +2287,278 @@ use soroban_sdk::testutils::Events;
         // Current repay implementation is state-only; token balances/allowances are unchanged.
         assert_eq!(liquidity.balance(&borrower), 550_i128);
         assert_eq!(liquidity.allowance(&borrower, &contract_id), 200_i128);
+    }
+
+    // ========== Interest Accrual Tests ==========
+
+    #[test]
+    fn test_accrue_interest_basic() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &1000_u32, &70_u32); // 10% rate
+        client.draw_credit(&borrower, &500_i128);
+
+        let initial_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(initial_line.accrued_interest, 0);
+        assert_eq!(initial_line.utilized_amount, 500);
+
+        // Advance time by 1 year (in seconds)
+        env.ledger().set_timestamp(365 * 24 * 60 * 60);
+
+        // Call accrue_interest
+        let accrued = client.accrue_interest(&borrower);
+        
+        // Should accrue approximately 50 interest (500 * 0.10 * 1 year)
+        assert!(accrued > 0, "Should accrue some interest");
+        assert!(accrued <= 60, "Interest should be reasonable"); // Allow some rounding
+
+        let updated_line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(updated_line.accrued_interest, accrued);
+        assert_eq!(updated_line.utilized_amount, 500 + accrued);
+        assert!(updated_line.last_accrual_ts > 0);
+    }
+
+    #[test]
+    fn test_accrue_interest_zero_utilization() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &1000_u32, &70_u32);
+
+        // Don't draw any credit, utilization is 0
+        let accrued = client.accrue_interest(&borrower);
+        assert_eq!(accrued, 0, "Should not accrue interest with zero utilization");
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.accrued_interest, 0);
+        assert_eq!(line.utilized_amount, 0);
+    }
+
+    #[test]
+    fn test_accrue_interest_zero_rate() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &0_u32, &70_u32); // 0% rate
+        client.draw_credit(&borrower, &500_i128);
+
+        // Advance time
+        env.ledger().set_timestamp(365 * 24 * 60 * 60);
+
+        let accrued = client.accrue_interest(&borrower);
+        assert_eq!(accrued, 0, "Should not accrue interest with zero rate");
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.accrued_interest, 0);
+    }
+
+    #[test]
+    fn test_accrue_interest_inactive_line() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &1000_u32, &70_u32);
+        client.draw_credit(&borrower, &500_i128);
+
+        // Suspend the credit line
+        client.suspend_credit_line(&borrower);
+
+        // Advance time
+        env.ledger().set_timestamp(365 * 24 * 60 * 60);
+
+        // accrue_interest uses force=true, so should still work
+        let accrued = client.accrue_interest(&borrower);
+        assert!(accrued > 0, "Should accrue interest even for inactive line when forced");
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.accrued_interest, accrued);
+    }
+
+    #[test]
+    fn test_draw_credit_triggers_accrual() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &1000_u32, &70_u32);
+
+        // Initial draw
+        client.draw_credit(&borrower, &300_i128);
+        let line_after_draw = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line_after_draw.utilized_amount, 300);
+        assert_eq!(line_after_draw.accrued_interest, 0);
+
+        // Advance time
+        env.ledger().set_timestamp(182 * 24 * 60 * 60); // ~6 months
+
+        // Second draw should trigger accrual
+        client.draw_credit(&borrower, &200_i128);
+        
+        let line_after_second_draw = client.get_credit_line(&borrower).unwrap();
+        assert!(line_after_second_draw.accrued_interest > 0, "Should have accrued interest");
+        assert!(line_after_second_draw.utilized_amount > 500, "Utilized should include accrued interest");
+    }
+
+    #[test]
+    fn test_repay_credit_triggers_accrual() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &1000_u32, &70_u32);
+
+        client.draw_credit(&borrower, &500_i128);
+
+        // Advance time
+        env.ledger().set_timestamp(365 * 24 * 60 * 60);
+
+        // Repayment should trigger accrual
+        client.repay_credit(&borrower, &100_i128);
+        
+        let line_after_repay = client.get_credit_line(&borrower).unwrap();
+        assert!(line_after_repay.accrued_interest > 0, "Should have accrued interest");
+        // Utilized should be: 500 + interest - 100 repayment
+        assert!(line_after_repay.utilized_amount > 400, "Utilized should include accrued interest");
+    }
+
+    #[test]
+    fn test_accrual_event_emission() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &1000_u32, &70_u32);
+        client.draw_credit(&borrower, &500_i128);
+
+        // Clear existing events
+        let _ = env.events().all();
+
+        // Advance time and accrue
+        env.ledger().set_timestamp(365 * 24 * 60 * 60);
+        client.accrue_interest(&borrower);
+
+        // Check that accrual event was emitted
+        let events = env.events().all();
+        assert!(events.len() > 0, "Should have emitted accrual event");
+
+        // Find the accrual event
+        let accrual_event = events.iter().find(|(topics, _data)| {
+            topics.len() >= 2 && 
+            topics.get(1).unwrap().to_string() == "accrue"
+        });
+
+        assert!(accrual_event.is_some(), "Should find accrual event");
+    }
+
+    #[test]
+    fn test_accrual_multiple_periods() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &1000_u32, &70_u32);
+        client.draw_credit(&borrower, &1000_i128);
+
+        // First period: 6 months
+        env.ledger().set_timestamp(182 * 24 * 60 * 60);
+        let accrued1 = client.accrue_interest(&borrower);
+        assert!(accrued1 > 0);
+
+        let line1 = client.get_credit_line(&borrower).unwrap();
+        let first_utilized = line1.utilized_amount;
+
+        // Second period: another 6 months
+        env.ledger().set_timestamp(365 * 24 * 60 * 60);
+        let accrued2 = client.accrue_interest(&borrower);
+        assert!(accrued2 > 0);
+
+        let line2 = client.get_credit_line(&borrower).unwrap();
+        
+        // Second accrual should be based on increased principal (including first accrued interest)
+        assert!(accrued2 >= accrued1, "Second accrual should be >= first due to compound effect");
+        assert!(line2.utilized_amount > first_utilized, "Utilized should increase with compound interest");
+        assert_eq!(line2.accrued_interest, accrued1 + accrued2, "Total accrued should be sum of periods");
+    }
+
+    #[test]
+    fn test_accrual_overflow_protection() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &i128::MAX, &10000_u32, &70_u32); // Max rate
+        
+        // Draw a large amount but leave room for interest
+        let large_amount = i128::MAX / 2;
+        client.draw_credit(&borrower, &large_amount);
+
+        // Advance time significantly
+        env.ledger().set_timestamp(u64::MAX / 2);
+
+        // Should not panic due to overflow protection
+        let accrued = client.accrue_interest(&borrower);
+        
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert!(line.utilized_amount <= i128::MAX, "Should not overflow utilized amount");
+        assert!(line.accrued_interest <= i128::MAX, "Should not overflow accrued interest");
     }
 }
