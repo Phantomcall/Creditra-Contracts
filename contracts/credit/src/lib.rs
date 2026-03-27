@@ -2551,10 +2551,7 @@ mod test {
         assert_eq!(event.credit_limit, 2_500);
         assert_eq!(event.interest_rate_bps, 450);
         assert_eq!(event.risk_score, 60);
-        assert_eq!(
-            event.event_type,
-            symbol_short!("opened")
-        );
+        assert_eq!(event.event_type, symbol_short!("opened"));
     }
 
     /// suspend_credit_line emits a CreditLineEvent with Suspended status.
