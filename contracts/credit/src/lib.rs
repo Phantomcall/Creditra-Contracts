@@ -1950,6 +1950,27 @@ mod test_rate_change_limits {
     }
 
     #[test]
+    fn test_rate_change_at_exact_interval_boundary_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, _admin) = setup(&env, &borrower, 5_000, 0);
+
+        client.set_rate_change_limits(&100_u32, &3600_u64);
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+        client.update_risk_parameters(&borrower, &5_000_i128, &350_u32, &70_u32);
+
+        // Exactly on the interval boundary: elapsed == 3600.
+        env.ledger().with_mut(|li| li.timestamp = 3700);
+        client.update_risk_parameters(&borrower, &5_000_i128, &330_u32, &70_u32);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.interest_rate_bps, 330);
+        assert_eq!(line.last_rate_update_ts, 3700);
+    }
+
+    #[test]
     fn test_rate_change_first_update_ignores_interval() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1963,6 +1984,27 @@ mod test_rate_change_limits {
 
         let line = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.interest_rate_bps, 350);
+    }
+
+    #[test]
+    fn test_zero_interval_disables_timing_check_after_first_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, _admin) = setup(&env, &borrower, 5_000, 0);
+
+        client.set_rate_change_limits(&100_u32, &0_u64);
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+        client.update_risk_parameters(&borrower, &5_000_i128, &350_u32, &70_u32);
+
+        // Immediate subsequent update should still pass because interval == 0 disables the gate.
+        env.ledger().with_mut(|li| li.timestamp = 101);
+        client.update_risk_parameters(&borrower, &5_000_i128, &330_u32, &70_u32);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.interest_rate_bps, 330);
+        assert_eq!(line.last_rate_update_ts, 101);
     }
 
     #[test]
