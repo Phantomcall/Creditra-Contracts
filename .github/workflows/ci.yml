@@ -63,6 +63,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: stable
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
@@ -83,6 +84,16 @@ jobs:
 
       - name: Enforce line coverage >= 95%
         run: cargo llvm-cov --workspace --all-targets --fail-under-lines 95
+
+      - name: Generate LCOV report
+        run: cargo llvm-cov --workspace --all-targets --lcov --output-path lcov.info
+
+      - name: Upload LCOV coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-report
+          path: lcov.info
+          retention-days: 30
 
   build-wasm:
     name: Build WASM
