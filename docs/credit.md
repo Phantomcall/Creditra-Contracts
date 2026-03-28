@@ -79,11 +79,21 @@ Opens a new credit line for a borrower. Called by the backend or risk engine.
 | Parameter | Type | Description |
 |---|---|---|
 | `borrower` | `Address` | Borrower's address |
-| `credit_limit` | `i128` | Maximum drawable amount |
-| `interest_rate_bps` | `u32` | Interest rate in basis points |
-| `risk_score` | `u32` | Risk score from the risk engine |
+| `credit_limit` | `i128` | Maximum drawable amount (must be > 0) |
+| `interest_rate_bps` | `u32` | Annual interest rate in basis points (0–10000) |
+| `risk_score` | `u32` | Risk score from the risk engine (0–100) |
 
-Emits: `("credit", "opened")` event.
+`last_rate_update_ts` is initialized to `0` (no rate update has occurred yet).
+
+#### Errors
+| Condition | Error |
+|---|---|
+| `credit_limit <= 0` | `ContractError::InvalidAmount` |
+| `interest_rate_bps > 10000` | `ContractError::RateTooHigh` |
+| `risk_score > 100` | `ContractError::ScoreTooHigh` |
+| Borrower already has an Active line | `ContractError::Unauthorized` |
+
+Emits: `("credit", "opened")` event with a `CreditLineEvent` payload.
 
 ---
 

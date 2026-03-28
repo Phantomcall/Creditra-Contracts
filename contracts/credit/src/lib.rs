@@ -13,7 +13,8 @@ mod events;
 mod types;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, Env,
+    Symbol,
 };
 
 use events::{
@@ -21,7 +22,7 @@ use events::{
     publish_risk_parameters_updated, CreditLineEvent, DrawnEvent, RepaymentEvent,
     RiskParametersUpdatedEvent,
 };
-use types::{CreditLineData, CreditStatus, RateChangeConfig};
+use types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
 
 /// Maximum interest rate in basis points (100%).
 const MAX_INTEREST_RATE_BPS: u32 = 10_000;
@@ -138,14 +139,14 @@ impl Credit {
     /// * `interest_rate_bps` - Annual interest rate in basis points (max 10000 = 100%)
     /// * `risk_score` - Borrower risk score (0–100)
     ///
-    /// # Panics
-    /// * If `credit_limit` <= 0
-    /// * If `interest_rate_bps` > 10000
-    /// * If `risk_score` > 100
-    /// * If an Active credit line already exists for the borrower
+    /// # Errors
+    /// * `ContractError::InvalidAmount` if `credit_limit` <= 0
+    /// * `ContractError::RateTooHigh` if `interest_rate_bps` > 10000
+    /// * `ContractError::ScoreTooHigh` if `risk_score` > 100
+    /// * Panics if an Active credit line already exists for the borrower
     ///
     /// # Events
-    /// Emits `(credit, opened)` with a `CreditLineEvent` payload.
+    /// Emits `("credit", "opened")` with a `CreditLineEvent` payload.
     pub fn open_credit_line(
         env: Env,
         borrower: Address,
@@ -153,12 +154,15 @@ impl Credit {
         interest_rate_bps: u32,
         risk_score: u32,
     ) {
-        assert!(credit_limit > 0, "credit_limit must be greater than zero");
-        assert!(
-            interest_rate_bps <= 10_000,
-            "interest_rate_bps cannot exceed 10000 (100%)"
-        );
-        assert!(risk_score <= 100, "risk_score must be between 0 and 100");
+        if credit_limit <= 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        if interest_rate_bps > MAX_INTEREST_RATE_BPS {
+            panic_with_error!(&env, ContractError::RateTooHigh);
+        }
+        if risk_score > MAX_RISK_SCORE {
+            panic_with_error!(&env, ContractError::ScoreTooHigh);
+        }
 
         // Prevent overwriting an existing Active credit line
         if let Some(existing) = env
@@ -166,11 +170,11 @@ impl Credit {
             .persistent()
             .get::<Address, CreditLineData>(&borrower)
         {
-            assert!(
-                existing.status != CreditStatus::Active,
-                "borrower already has an active credit line"
-            );
+            if existing.status == CreditStatus::Active {
+                panic_with_error!(&env, ContractError::Unauthorized);
+            }
         }
+
         let credit_line = CreditLineData {
             borrower: borrower.clone(),
             credit_limit,
@@ -655,9 +659,7 @@ mod test {
 
     // ========== open_credit_line: duplicate borrower and invalid params (#28) ==========
 
-    /// open_credit_line must revert when the borrower already has an Active credit line.
     #[test]
-    #[should_panic(expected = "borrower already has an active credit line")]
     fn test_open_credit_line_duplicate_active_borrower_reverts() {
         let env = Env::default();
         env.mock_all_auths();
@@ -670,13 +672,15 @@ mod test {
 
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
-        // Second open for same borrower while Active must revert.
-        client.open_credit_line(&borrower, &2000_i128, &400_u32, &60_u32);
+
+        let result = client.try_open_credit_line(&borrower, &2000_i128, &400_u32, &60_u32);
+        assert_eq!(
+            result.err().unwrap().unwrap(),
+            soroban_sdk::Error::from_contract_error(1) // ContractError::Unauthorized
+        );
     }
 
-    /// open_credit_line must revert when credit_limit is zero.
     #[test]
-    #[should_panic(expected = "credit_limit must be greater than zero")]
     fn test_open_credit_line_zero_limit_reverts() {
         let env = Env::default();
         env.mock_all_auths();
@@ -688,12 +692,15 @@ mod test {
         let client = CreditClient::new(&env, &contract_id);
 
         client.init(&admin);
-        client.open_credit_line(&borrower, &0_i128, &300_u32, &70_u32);
+
+        let result = client.try_open_credit_line(&borrower, &0_i128, &300_u32, &70_u32);
+        assert_eq!(
+            result.err().unwrap().unwrap(),
+            soroban_sdk::Error::from_contract_error(5) // ContractError::InvalidAmount
+        );
     }
 
-    /// open_credit_line must revert when credit_limit is negative.
     #[test]
-    #[should_panic(expected = "credit_limit must be greater than zero")]
     fn test_open_credit_line_negative_limit_reverts() {
         let env = Env::default();
         env.mock_all_auths();
@@ -705,12 +712,15 @@ mod test {
         let client = CreditClient::new(&env, &contract_id);
 
         client.init(&admin);
-        client.open_credit_line(&borrower, &-1_i128, &300_u32, &70_u32);
+
+        let result = client.try_open_credit_line(&borrower, &(-1_i128), &300_u32, &70_u32);
+        assert_eq!(
+            result.err().unwrap().unwrap(),
+            soroban_sdk::Error::from_contract_error(5) // ContractError::InvalidAmount
+        );
     }
 
-    /// open_credit_line must revert when interest_rate_bps exceeds 10000 (100%).
     #[test]
-    #[should_panic(expected = "interest_rate_bps cannot exceed 10000 (100%)")]
     fn test_open_credit_line_interest_rate_exceeds_max_reverts() {
         let env = Env::default();
         env.mock_all_auths();
@@ -722,12 +732,15 @@ mod test {
         let client = CreditClient::new(&env, &contract_id);
 
         client.init(&admin);
-        client.open_credit_line(&borrower, &1000_i128, &10_001_u32, &70_u32);
+
+        let result = client.try_open_credit_line(&borrower, &1000_i128, &10_001_u32, &70_u32);
+        assert_eq!(
+            result.err().unwrap().unwrap(),
+            soroban_sdk::Error::from_contract_error(8) // ContractError::RateTooHigh
+        );
     }
 
-    /// open_credit_line must revert when risk_score exceeds 100.
     #[test]
-    #[should_panic(expected = "risk_score must be between 0 and 100")]
     fn test_open_credit_line_risk_score_exceeds_max_reverts() {
         let env = Env::default();
         env.mock_all_auths();
@@ -739,7 +752,12 @@ mod test {
         let client = CreditClient::new(&env, &contract_id);
 
         client.init(&admin);
-        client.open_credit_line(&borrower, &1000_i128, &300_u32, &101_u32);
+
+        let result = client.try_open_credit_line(&borrower, &1000_i128, &300_u32, &101_u32);
+        assert_eq!(
+            result.err().unwrap().unwrap(),
+            soroban_sdk::Error::from_contract_error(9) // ContractError::ScoreTooHigh
+        );
     }
 
     // ========== draw_credit within limit (#29) ==========
@@ -2106,5 +2124,173 @@ mod test_rate_change_limits {
         client.init(&admin);
 
         client.set_rate_change_limits(&100_u32, &0_u64);
+    }
+
+    #[test]
+    fn test_open_credit_line_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.borrower, borrower);
+        assert_eq!(line.credit_limit, 1000);
+        assert_eq!(line.utilized_amount, 0);
+        assert_eq!(line.interest_rate_bps, 300);
+        assert_eq!(line.risk_score, 70);
+        assert_eq!(line.status, CreditStatus::Active);
+        assert_eq!(line.last_rate_update_ts, 0);
+    }
+
+    #[test]
+    fn test_open_credit_line_zero_limit_returns_invalid_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+
+        let result = client.try_open_credit_line(&borrower, &0_i128, &300_u32, &70_u32);
+        assert_eq!(
+            result.err().unwrap().unwrap(),
+            soroban_sdk::Error::from(ContractError::InvalidAmount)
+        );
+    }
+
+    #[test]
+    fn test_open_credit_line_negative_limit_returns_invalid_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+
+        let result = client.try_open_credit_line(&borrower, &(-1_i128), &300_u32, &70_u32);
+        assert_eq!(
+            result.err().unwrap().unwrap(),
+            soroban_sdk::Error::from(ContractError::InvalidAmount)
+        );
+    }
+
+    #[test]
+    fn test_open_credit_line_rate_exceeds_max_returns_rate_too_high() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+
+        let result = client.try_open_credit_line(&borrower, &1000_i128, &10_001_u32, &70_u32);
+        assert_eq!(
+            result.err().unwrap().unwrap(),
+            soroban_sdk::Error::from(ContractError::RateTooHigh)
+        );
+    }
+
+    #[test]
+    fn test_open_credit_line_risk_score_exceeds_max_returns_score_too_high() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+
+        let result = client.try_open_credit_line(&borrower, &1000_i128, &300_u32, &101_u32);
+        assert_eq!(
+            result.err().unwrap().unwrap(),
+            soroban_sdk::Error::from(ContractError::ScoreTooHigh)
+        );
+    }
+
+    #[test]
+    fn test_open_credit_line_duplicate_active_returns_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+
+        let result = client.try_open_credit_line(&borrower, &2000_i128, &400_u32, &60_u32);
+        assert_eq!(
+            result.err().unwrap().unwrap(),
+            soroban_sdk::Error::from(ContractError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn test_open_credit_line_at_max_boundaries_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &i128::MAX, &10_000_u32, &100_u32);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.interest_rate_bps, 10_000);
+        assert_eq!(line.risk_score, 100);
+        assert_eq!(line.credit_limit, i128::MAX);
+    }
+
+    #[test]
+    fn test_open_credit_line_closed_borrower_can_reopen() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
+        client.close_credit_line(&borrower, &admin);
+
+        // Closed borrower must be allowed to reopen
+        client.open_credit_line(&borrower, &2000_i128, &400_u32, &60_u32);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.credit_limit, 2000);
+        assert_eq!(line.status, CreditStatus::Active);
     }
 }
