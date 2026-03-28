@@ -46,11 +46,6 @@ fn admin_key(env: &Env) -> Symbol {
     Symbol::new(env, "admin")
 }
 
-/// Instance storage key for rate-change limit configuration.
-fn rate_cfg_key(env: &Env) -> Symbol {
-    Symbol::new(env, "rate_cfg")
-}
-
 fn require_admin(env: &Env) -> Address {
     env.storage()
         .instance()
