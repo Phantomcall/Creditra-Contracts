@@ -1,6 +1,6 @@
 # Creditra Contracts
 
-Soroban smart contracts for the Creditra adaptive credit protocol on Stellar.
+Core smart contracts for the Creditra protocol, managing credit lines, draw operations, repayments, and risk parameters.
 
 This repo contains the **credit** contract: it maintains credit lines, tracks utilization, enforces limits, and exposes methods for opening lines, drawing, repaying, and updating risk parameters. Draw logic includes a liquidity reserve check and token transfer flow.
 
@@ -52,9 +52,9 @@ This repo contains the **credit** contract: it maintains credit lines, tracks ut
 
 ## Setup and build
 
+### Build
 ```bash
-cd creditra-contracts
-cargo build --release -p creditra-credit
+cargo build
 ```
 
 ### WASM build (release profile, size-optimized)
@@ -83,28 +83,7 @@ Avoid large dependencies; prefer minimal use of the Soroban SDK surface to stay 
 cargo test -p creditra-credit
 ```
 
-For test helper conventions (mock token balances/allowances in draw and repay
-scenarios), see `docs/contributing-tests.md`.
-
-### Overflow scenario tests (large amounts)
-
-The credit contract includes dedicated overflow and large-value tests in
-`contracts/credit/src/lib.rs`:
-
-- `test_draw_credit_near_i128_max_succeeds_without_overflow`
-- `test_draw_credit_overflow_reverts_with_defined_error`
-- `test_draw_credit_large_values_exceed_limit_reverts_with_defined_error`
-
-These tests validate that:
-
-- near-`i128::MAX` draws succeed when within limit;
-- arithmetic overflow reverts with the defined `"overflow"` panic;
-- large-value over-limit draws revert with the defined `"exceeds credit limit"` panic.
-
 ### Coverage
-
-Run coverage with:
-
 ```bash
 cargo llvm-cov --workspace --all-targets --fail-under-lines 95
 ```
