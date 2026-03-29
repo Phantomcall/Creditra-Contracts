@@ -2165,19 +2165,18 @@ mod test_e2e_lifecycle_happy {
         let line = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.status, CreditStatus::Closed);
 
-        // ── Event assertions: verify the last credit event is "closed" ───────
-        // (SAC transfer events are interleaved; filter to the last credit event)
+        // ── Event assertion: last credit event is "closed" ───────────────────
         let events = env.events().all();
         let last_credit = events
             .iter()
-            .rev()
-            .find(|(_c, topics, _d)| {
+            .filter(|(_c, topics, _d)| {
                 topics
                     .get(0)
                     .and_then(|v| Symbol::try_from_val(&env, &v).ok())
                     .map(|s: Symbol| s == symbol_short!("credit"))
                     .unwrap_or(false)
             })
+            .last()
             .expect("no credit event found");
         let (_c, topics, data) = last_credit;
         assert_eq!(
