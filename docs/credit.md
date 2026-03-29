@@ -118,6 +118,25 @@ Update the risk parameters for an existing credit line. Admin-only.
 | `interest_rate_bps` | `u32`     | New interest rate in basis points (0–10000)            |
 | `risk_score`        | `u32`     | New risk score (0–100)                                 |
 
+#### Credit Limit Decrease Behavior
+
+When `credit_limit` is decreased below the current `utilized_amount`:
+
+- The credit line status changes to **Restricted**
+- `utilized_amount` remains unchanged (borrower must repay excess)
+- `draw_credit` is disabled until excess is repaid or limit is increased
+- A `("credit", "limit_dec")` event is emitted with details
+
+When `credit_limit` is decreased but remains ≥ `utilized_amount`:
+
+- The credit line remains **Active**
+- Normal operation continues
+
+When `credit_limit` is increased or unchanged:
+
+- Normal behavior applies
+- If currently Restricted, increasing limit above `utilized_amount` reactivates to **Active**
+
 #### Rate-change limits (optional, backward-compatible)
 
 When a `RateChangeConfig` has been set via `set_rate_change_limits`, the following

@@ -17,8 +17,8 @@ use soroban_sdk::{
 };
 
 use events::{
-    publish_credit_line_event, publish_drawn_event, publish_repayment_event,
-    publish_risk_parameters_updated, CreditLineEvent, DrawnEvent, RepaymentEvent,
+    publish_credit_line_event, publish_drawn_event, publish_limit_decrease_event, publish_repayment_event,
+    publish_risk_parameters_updated, CreditLineEvent, DrawnEvent, LimitDecreaseEvent, RepaymentEvent,
     RiskParametersUpdatedEvent,
 };
 use types::{CreditLineData, CreditStatus, RateChangeConfig};
@@ -221,6 +221,11 @@ impl Credit {
             env.panic_with_error(ContractError::InvalidAmount);
         }
 
+        if credit_line.status == CreditStatus::Restricted {
+            clear_reentrancy_guard(&env);
+            panic!("credit line is restricted - repay excess amount first");
+        }
+
         let updated_utilized = credit_line
             .utilized_amount
             .checked_add(amount)
@@ -348,6 +353,12 @@ impl Credit {
             .saturating_sub(effective_repay)
             .max(0);
         credit_line.utilized_amount = new_utilized;
+        
+        // If credit line was Restricted and utilization is now within limit, reactivate it
+        if credit_line.status == CreditStatus::Restricted && new_utilized <= credit_line.credit_limit {
+            credit_line.status = CreditStatus::Active;
+        }
+        
         env.storage().persistent().set(&borrower, &credit_line);
 
         // --- Emit event ---
@@ -417,8 +428,39 @@ impl Credit {
         if credit_limit < 0 {
             panic!("credit_limit must be non-negative");
         }
-        if credit_limit < credit_line.utilized_amount {
-            panic!("credit_limit cannot be less than utilized amount");
+        
+        // Handle credit limit decrease vs utilized amount
+        let old_limit = credit_line.credit_limit;
+        let is_limit_decrease = credit_limit < old_limit;
+        let excess_amount = if is_limit_decrease && credit_limit < credit_line.utilized_amount {
+            credit_line.utilized_amount - credit_limit
+        } else {
+            0
+        };
+        
+        if excess_amount > 0 {
+            // Limit decreased below utilized amount - place in Restricted status
+            credit_line.credit_limit = credit_limit;
+            credit_line.status = CreditStatus::Restricted;
+            
+            // Emit limit decrease event
+            let timestamp = env.ledger().timestamp();
+            publish_limit_decrease_event(
+                &env,
+                LimitDecreaseEvent {
+                    borrower: borrower.clone(),
+                    old_limit,
+                    new_limit: credit_limit,
+                    utilized_amount: credit_line.utilized_amount,
+                    excess_amount,
+                    timestamp,
+                },
+            );
+            
+            // Note: utilized_amount remains unchanged until borrower repays
+        } else {
+            // Normal limit increase or decrease within utilization
+            credit_line.credit_limit = credit_limit;
         }
         if interest_rate_bps > MAX_INTEREST_RATE_BPS {
             panic!("interest_rate_bps exceeds maximum");
