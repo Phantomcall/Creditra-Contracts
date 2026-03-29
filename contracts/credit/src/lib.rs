@@ -21,7 +21,7 @@ use events::{
     publish_risk_parameters_updated, CreditLineEvent, DrawnEvent, RepaymentEvent,
     RiskParametersUpdatedEvent,
 };
-use types::{CreditLineData, CreditStatus, ContractError, RateChangeConfig};
+use types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
 
 /// Maximum interest rate in basis points (100%).
 const MAX_INTEREST_RATE_BPS: u32 = 10_000;
@@ -96,13 +96,17 @@ impl Credit {
     /// @notice Sets the token contract used for reserve/liquidity checks and draw transfers.
     pub fn set_liquidity_token(env: Env, token_address: Address) {
         require_admin_auth(&env);
-        env.storage().instance().set(&DataKey::LiquidityToken, &token_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::LiquidityToken, &token_address);
     }
 
     /// @notice Sets the address that provides liquidity for draw operations.
     pub fn set_liquidity_source(env: Env, reserve_address: Address) {
         require_admin_auth(&env);
-        env.storage().instance().set(&DataKey::LiquiditySource, &reserve_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::LiquiditySource, &reserve_address);
     }
 
     /// Open a new credit line for a borrower (called by backend/risk engine).
@@ -481,9 +485,16 @@ impl Credit {
     }
 
     /// Set rate-change limits (admin only).
-    pub fn set_rate_change_limits(env: Env, max_rate_change_bps: u32, rate_change_min_interval: u64) {
+    pub fn set_rate_change_limits(
+        env: Env,
+        max_rate_change_bps: u32,
+        rate_change_min_interval: u64,
+    ) {
         require_admin_auth(&env);
-        let cfg = RateChangeConfig { max_rate_change_bps, rate_change_min_interval };
+        let cfg = RateChangeConfig {
+            max_rate_change_bps,
+            rate_change_min_interval,
+        };
         env.storage().instance().set(&rate_cfg_key(&env), &cfg);
     }
 
@@ -2145,7 +2156,10 @@ mod test_e2e_lifecycle_happy {
         assert_eq!(line.status, CreditStatus::Active);
         assert_eq!(line.utilized_amount, 0);
         assert_eq!(line.credit_limit, 1_000);
-        assert!(has_event(&env, symbol_short!("opened")), "expected 'opened' event");
+        assert!(
+            has_event(&env, symbol_short!("opened")),
+            "expected 'opened' event"
+        );
 
         // ── Step 2: draw 600 ─────────────────────────────────────────────────
         client.draw_credit(&borrower, &600_i128);
@@ -2155,7 +2169,10 @@ mod test_e2e_lifecycle_happy {
         assert_eq!(line.utilized_amount, 600);
         assert_eq!(token.balance(&contract_id), 400_i128);
         assert_eq!(token.balance(&borrower), 600_i128);
-        assert!(has_event(&env, symbol_short!("drawn")), "expected 'drawn' event");
+        assert!(
+            has_event(&env, symbol_short!("drawn")),
+            "expected 'drawn' event"
+        );
 
         // ── Step 3: full repay 600 ───────────────────────────────────────────
         // Borrower must approve the contract to pull tokens via transfer_from.
@@ -2167,13 +2184,19 @@ mod test_e2e_lifecycle_happy {
         assert_eq!(line.utilized_amount, 0);
         assert_eq!(token.balance(&borrower), 0_i128);
         assert_eq!(token.balance(&contract_id), 1_000_i128);
-        assert!(has_event(&env, symbol_short!("repay")), "expected 'repay' event");
+        assert!(
+            has_event(&env, symbol_short!("repay")),
+            "expected 'repay' event"
+        );
 
         // ── Step 4: borrower self-closes (zero utilization) ──────────────────
         client.close_credit_line(&borrower, &borrower);
 
         let line = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.status, CreditStatus::Closed);
-        assert!(has_event(&env, symbol_short!("closed")), "expected 'closed' event");
+        assert!(
+            has_event(&env, symbol_short!("closed")),
+            "expected 'closed' event"
+        );
     }
 }
