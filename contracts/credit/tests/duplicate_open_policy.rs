@@ -89,7 +89,7 @@ mod test_helpers {
                 client.close_credit_line(&borrower, &admin);
             }
             CreditStatus::Restricted => {
-                // Restricted is set internally; not directly reachable via lifecycle calls
+                // Restricted is not directly reachable via public API in tests
             }
         }
 
