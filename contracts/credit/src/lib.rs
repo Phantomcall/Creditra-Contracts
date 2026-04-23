@@ -37,11 +37,7 @@ use events::{
 };
 // removed duplicate import of types; rely on earlier crate::types import
 
-/// Maximum interest rate in basis points (100%).
-const MAX_INTEREST_RATE_BPS: u32 = 10_000;
-
-/// Maximum risk score (0–100 scale).
-const MAX_RISK_SCORE: u32 = 100;
+// constants removed - imported from risk module
 
 /// Instance storage key for reentrancy guard.
 fn reentrancy_key(env: &Env) -> Symbol {
@@ -56,8 +52,9 @@ fn admin_key(env: &Env) -> Symbol {
 // duplicate events import removed
 use crate::storage::{clear_reentrancy_guard, set_reentrancy_guard, DataKey};
 use crate::types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig, RateFormulaConfig};
-use crate::auth::require_admin_auth; // added missing import
-use crate::storage::rate_cfg_key; // added missing import
+use crate::auth::require_admin_auth;
+use crate::storage::rate_cfg_key;
+use crate::risk::{MAX_INTEREST_RATE_BPS, MAX_RISK_SCORE};
 
 #[contract]
 pub struct Credit;
@@ -116,9 +113,6 @@ impl Credit {
         risk_score: u32,
     ) {
         assert!(credit_limit > 0, "credit_limit must be greater than zero");
-        if interest_rate_bps > MAX_INTEREST_RATE_BPS {
-            env.panic_with_error(ContractError::RateTooHigh);
-        }
         if risk_score > MAX_RISK_SCORE {
             env.panic_with_error(ContractError::ScoreTooHigh);
         }
@@ -135,11 +129,24 @@ impl Credit {
             );
         }
 
+        // Determine the effective interest rate:
+        // - If a rate formula config is stored, compute from risk_score (ignore passed rate).
+        // - Otherwise, use the manually supplied interest_rate_bps.
+        let effective_rate = if let Some(formula_cfg) = risk::get_rate_formula_config(env.clone()) {
+            risk::compute_rate_from_score(&formula_cfg, risk_score)
+        } else {
+            interest_rate_bps
+        };
+
+        if effective_rate > MAX_INTEREST_RATE_BPS {
+            env.panic_with_error(ContractError::RateTooHigh);
+        }
+
         let credit_line = CreditLineData {
             borrower: borrower.clone(),
             credit_limit,
             utilized_amount: 0,
-            interest_rate_bps,
+            interest_rate_bps: effective_rate,
             risk_score,
             status: CreditStatus::Active,
             last_rate_update_ts: 0,
@@ -157,25 +164,12 @@ impl Credit {
                 borrower: borrower.clone(),
                 status: CreditStatus::Active,
                 credit_limit,
-                interest_rate_bps,
+                interest_rate_bps: effective_rate,
                 risk_score,
             },
         );
     }
 
-    /// Update risk parameters for an existing credit line.
-    ///
-    /// Called by admin or risk engine when a borrower's risk profile changes.
-    ///
-    /// # Parameters
-    /// - `borrower`: The borrower's address.
-    /// - `credit_limit`: New credit limit.
-    /// - `interest_rate_bps`: New interest rate in basis points.
-    /// - `risk_score`: New risk score.
-    ///
-    /// # Note
-    /// Not yet implemented. Planned logic: load existing record, update fields,
-    /// persist updated [`CreditLineData`].
     /// @notice Draws credit by transferring liquidity tokens to the borrower.
     /// @dev Enforces status/limit/liquidity checks and uses a reentrancy guard.
     pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {

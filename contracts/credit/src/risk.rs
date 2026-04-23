@@ -39,6 +39,24 @@ pub fn compute_rate_from_score(cfg: &RateFormulaConfig, risk_score: u32) -> u32 
     raw.clamp(cfg.min_rate_bps, upper)
 }
 
+/// Update risk parameters for an existing credit line (admin only).
+///
+/// This function handles updating the credit limit, risk score, and interest rate.
+/// If a dynamic rate formula is configured, the `interest_rate_bps` parameter is
+/// ignored and the rate is re-calculated based on the provided `risk_score`.
+///
+/// # Arguments
+/// * `env` - The Soroban environment.
+/// * `borrower` - The address of the borrower.
+/// * `credit_limit` - The new credit limit (must be >= 0 and >= current utilization).
+/// * `interest_rate_bps` - The manual interest rate (ignored if formula is enabled).
+/// * `risk_score` - The new risk score (0-100).
+///
+/// # Panics
+/// * If caller is not admin.
+/// * If credit line does not exist.
+/// * If validation fails (limit < utilization, score > 100, etc.).
+/// * If rate change exceeds configured limits.
 pub fn update_risk_parameters(
     env: Env,
     borrower: Address,
@@ -204,6 +222,9 @@ pub fn clear_rate_formula_config(env: Env) {
 /// Get the current rate formula configuration (view function).
 ///
 /// Returns `None` if no formula is configured (manual mode).
+///
+/// # Returns
+/// An `Option<RateFormulaConfig>` containing the current parameters if enabled.
 pub fn get_rate_formula_config(env: Env) -> Option<RateFormulaConfig> {
     env.storage()
         .instance()
