@@ -72,6 +72,9 @@ pub fn update_risk_parameters(
         .get(&borrower)
         .expect("Credit line not found");
 
+    // Apply interest accrual before any mutation
+    credit_line = crate::accrual::apply_accrual(&env, credit_line);
+
     if credit_limit < 0 {
         panic!("credit_limit must be non-negative");
     }
@@ -138,113 +141,4 @@ pub fn update_risk_parameters(
             risk_score,
         },
     );
-}
-
-/// Set the risk-score-based rate formula configuration (admin only).
-///
-/// Once set, `update_risk_parameters` will automatically compute
-/// `interest_rate_bps` from the borrower's `risk_score` using the
-/// piecewise-linear formula, ignoring the manually supplied rate.
-///
-/// # Validation
-/// - `min_rate_bps` must be ≤ `max_rate_bps`.
-/// - `max_rate_bps` must be ≤ `MAX_INTEREST_RATE_BPS` (10,000).
-/// - `base_rate_bps` must be ≤ `MAX_INTEREST_RATE_BPS`.
-///
-/// # Events
-/// Emits `("credit", "rate_cfg")` with `RateFormulaConfigEvent { enabled: true, ... }`.
-pub fn set_rate_formula_config(
-    env: Env,
-    base_rate_bps: u32,
-    slope_bps_per_score: u32,
-    min_rate_bps: u32,
-    max_rate_bps: u32,
-) {
-    require_admin_auth(&env);
-
-    if min_rate_bps > max_rate_bps {
-        panic!("min_rate_bps must be <= max_rate_bps");
-    }
-    if max_rate_bps > MAX_INTEREST_RATE_BPS {
-        panic!("max_rate_bps exceeds MAX_INTEREST_RATE_BPS");
-    }
-    if base_rate_bps > MAX_INTEREST_RATE_BPS {
-        panic!("base_rate_bps exceeds MAX_INTEREST_RATE_BPS");
-    }
-
-    let cfg = RateFormulaConfig {
-        base_rate_bps,
-        slope_bps_per_score,
-        min_rate_bps,
-        max_rate_bps,
-    };
-    env.storage()
-        .instance()
-        .set(&rate_formula_key(&env), &cfg);
-
-    publish_rate_formula_config_event(
-        &env,
-        RateFormulaConfigEvent {
-            base_rate_bps,
-            slope_bps_per_score,
-            min_rate_bps,
-            max_rate_bps,
-            enabled: true,
-        },
-    );
-}
-
-/// Remove the rate formula configuration, reverting to manual rate mode (admin only).
-///
-/// After this call, `update_risk_parameters` will use the manually supplied
-/// `interest_rate_bps` as before.
-///
-/// # Events
-/// Emits `("credit", "rate_cfg")` with `RateFormulaConfigEvent { enabled: false, ... }`.
-pub fn clear_rate_formula_config(env: Env) {
-    require_admin_auth(&env);
-    env.storage()
-        .instance()
-        .remove(&rate_formula_key(&env));
-
-    publish_rate_formula_config_event(
-        &env,
-        RateFormulaConfigEvent {
-            base_rate_bps: 0,
-            slope_bps_per_score: 0,
-            min_rate_bps: 0,
-            max_rate_bps: 0,
-            enabled: false,
-        },
-    );
-}
-
-/// Get the current rate formula configuration (view function).
-///
-/// Returns `None` if no formula is configured (manual mode).
-///
-/// # Returns
-/// An `Option<RateFormulaConfig>` containing the current parameters if enabled.
-pub fn get_rate_formula_config(env: Env) -> Option<RateFormulaConfig> {
-    env.storage()
-        .instance()
-        .get(&rate_formula_key(&env))
-}
-
-/// Set rate-change limits (admin only).
-///
-/// Configures the maximum allowed interest-rate change per call and the
-/// minimum time interval between consecutive rate changes.
-pub fn set_rate_change_limits(env: Env, max_rate_change_bps: u32, rate_change_min_interval: u64) {
-    require_admin_auth(&env);
-    let cfg = RateChangeConfig {
-        max_rate_change_bps,
-        rate_change_min_interval,
-    };
-    env.storage().instance().set(&rate_cfg_key(&env), &cfg);
-}
-
-/// Get the current rate-change limit configuration (view function).
-pub fn get_rate_change_limits(env: Env) -> Option<RateChangeConfig> {
-    env.storage().instance().get(&rate_cfg_key(&env))
 }
