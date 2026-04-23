@@ -18,24 +18,8 @@ mod query;
 mod risk;
 mod storage;
 pub mod types;
-mod auth;
-mod storage;
 mod borrow;
-mod config;
-mod lifecycle;
-mod risk;
-mod query;
-
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
-};
-
-use events::{
-    publish_credit_line_event, publish_drawn_event, publish_repayment_event,
-    publish_risk_parameters_updated, CreditLineEvent, DrawnEvent, RepaymentEvent,
-    RiskParametersUpdatedEvent,
-};
-use types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol};
 
 /// Maximum interest rate in basis points (100%).
 const MAX_INTEREST_RATE_BPS: u32 = 10_000;
@@ -53,12 +37,19 @@ fn admin_key(env: &Env) -> Symbol {
     Symbol::new(env, "admin")
 }
 
-pub mod types;
-
-use crate::events::{publish_drawn_event, publish_repayment_event, DrawnEvent, RepaymentEvent};
-use crate::storage::{clear_reentrancy_guard, set_reentrancy_guard, DataKey};
+use crate::events::{
+    publish_credit_line_event,
+    publish_admin_rotation_accepted, publish_admin_rotation_proposed, publish_drawn_event,
+    publish_repayment_event, publish_risk_parameters_updated, AdminRotationAcceptedEvent,
+    AdminRotationProposedEvent, CreditLineEvent, DrawnEvent, RepaymentEvent,
+    RiskParametersUpdatedEvent,
+};
+use crate::auth::{require_admin, require_admin_auth};
+use crate::storage::{
+    clear_reentrancy_guard, proposed_admin_key, proposed_at_key, rate_cfg_key,
+    set_reentrancy_guard, DataKey,
+};
 use crate::types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
-use soroban_sdk::{contract, contractimpl, token, Address, Env};
 
 #[contract]
 pub struct Credit;
@@ -91,6 +82,62 @@ impl Credit {
         env.storage()
             .instance()
             .set(&DataKey::LiquiditySource, &env.current_contract_address());
+    }
+
+    /// Propose a new admin with an optional acceptance delay.
+    ///
+    /// A second proposal overwrites any prior pending proposal.
+    pub fn propose_admin(env: Env, new_admin: Address, delay_seconds: u64) {
+        let current_admin = require_admin_auth(&env);
+        let accept_after = env.ledger().timestamp().saturating_add(delay_seconds);
+
+        env.storage()
+            .instance()
+            .set(&proposed_admin_key(&env), &new_admin);
+        env.storage()
+            .instance()
+            .set(&proposed_at_key(&env), &accept_after);
+
+        publish_admin_rotation_proposed(
+            &env,
+            AdminRotationProposedEvent {
+                current_admin,
+                proposed_admin: new_admin,
+                accept_after,
+            },
+        );
+    }
+
+    /// Accept pending admin role by the currently proposed admin.
+    pub fn accept_admin(env: Env) {
+        let proposed_admin: Address = env
+            .storage()
+            .instance()
+            .get(&proposed_admin_key(&env))
+            .unwrap_or_else(|| panic!("no pending admin proposal"));
+        let accept_after: u64 = env
+            .storage()
+            .instance()
+            .get(&proposed_at_key(&env))
+            .unwrap_or(0_u64);
+
+        proposed_admin.require_auth();
+        if env.ledger().timestamp() < accept_after {
+            env.panic_with_error(ContractError::AdminAcceptTooEarly);
+        }
+
+        let previous_admin = require_admin(&env);
+        env.storage().instance().set(&admin_key(&env), &proposed_admin);
+        env.storage().instance().remove(&proposed_admin_key(&env));
+        env.storage().instance().remove(&proposed_at_key(&env));
+
+        publish_admin_rotation_accepted(
+            &env,
+            AdminRotationAcceptedEvent {
+                previous_admin,
+                new_admin: proposed_admin,
+            },
+        );
     }
 
     /// @notice Sets the token contract used for reserve/liquidity checks and draw transfers.
@@ -466,32 +513,6 @@ impl Credit {
         env.storage().persistent().get(&borrower)
     }
 
-    /// Reinstate a defaulted credit line to Active (admin only).
-    pub fn reinstate_credit_line(env: Env, borrower: Address) {
-        require_admin_auth(&env);
-        let mut credit_line: CreditLineData = env
-            .storage()
-            .persistent()
-            .get(&borrower)
-            .expect("Credit line not found");
-        if credit_line.status != CreditStatus::Defaulted {
-            panic!("credit line is not defaulted");
-        }
-        credit_line.status = CreditStatus::Active;
-        env.storage().persistent().set(&borrower, &credit_line);
-        publish_credit_line_event(
-            &env,
-            (symbol_short!("credit"), symbol_short!("reinstate")),
-            CreditLineEvent {
-                event_type: symbol_short!("reinstate"),
-                borrower: borrower.clone(),
-                status: CreditStatus::Active,
-                credit_limit: credit_line.credit_limit,
-                interest_rate_bps: credit_line.interest_rate_bps,
-                risk_score: credit_line.risk_score,
-            },
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1156,8 +1177,6 @@ mod test {
         assert_eq!(line.status, CreditStatus::Active);
         assert_utilization_invariants(&line);
     }
-}
-
 #[cfg(test)]
 mod test_smoke_coverage {
     use super::*;

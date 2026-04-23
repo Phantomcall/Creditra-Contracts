@@ -131,6 +131,23 @@ pub struct DrawnEventV2 {
     pub timestamp: u64,
 }
 
+/// Event emitted when admin rotation is proposed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRotationProposedEvent {
+    pub current_admin: Address,
+    pub proposed_admin: Address,
+    pub accept_after: u64,
+}
+
+/// Event emitted when admin rotation is accepted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRotationAcceptedEvent {
+    pub previous_admin: Address,
+    pub new_admin: Address,
+}
+
 /// Publish a credit line lifecycle event.
 pub fn publish_credit_line_event(env: &Env, topic: (Symbol, Symbol), event: CreditLineEvent) {
     env.events().publish(topic, event);
@@ -181,4 +198,20 @@ pub fn publish_risk_parameters_updated(env: &Env, event: RiskParametersUpdatedEv
 pub fn publish_interest_accrued_event(env: &Env, event: InterestAccruedEvent) {
     env.events()
         .publish((symbol_short!("credit"), symbol_short!("accrue")), event);
+}
+
+/// Publish an admin rotation proposal event.
+pub fn publish_admin_rotation_proposed(env: &Env, event: AdminRotationProposedEvent) {
+    env.events().publish(
+        (symbol_short!("credit"), Symbol::new(env, "admin_prop")),
+        event,
+    );
+}
+
+/// Publish an admin rotation acceptance event.
+pub fn publish_admin_rotation_accepted(env: &Env, event: AdminRotationAcceptedEvent) {
+    env.events().publish(
+        (symbol_short!("credit"), Symbol::new(env, "admin_acc")),
+        event,
+    );
 }
