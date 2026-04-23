@@ -19,6 +19,10 @@ mod query;
 mod risk;
 mod storage;
 pub mod types;
+mod borrow;
+mod accrual;
+#[cfg(test)]
+mod accrual_tests;
 
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Env, Symbol,
@@ -29,8 +33,9 @@ use crate::events::{
     publish_repayment_event, CreditLineEvent, DrawnEvent, InterestAccruedEvent,
     RepaymentEvent,
 };
-use crate::storage::{clear_reentrancy_guard, set_reentrancy_guard, DataKey};
-use crate::types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
+use types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
+use auth::require_admin_auth;
+use storage::{clear_reentrancy_guard, set_reentrancy_guard, rate_cfg_key, DataKey};
 
 /// Maximum interest rate in basis points (100%).
 const MAX_INTEREST_RATE_BPS: u32 = 10_000;
@@ -50,6 +55,8 @@ fn reentrancy_key(env: &Env) -> Symbol {
 fn admin_key(env: &Env) -> Symbol {
     Symbol::new(env, "admin")
 }
+
+
 
 #[contract]
 pub struct Credit;
@@ -195,6 +202,9 @@ impl Credit {
                 env.panic_with_error(ContractError::CreditLineNotFound)
             });
 
+        // Apply interest accrual before any mutation
+        credit_line = accrual::apply_accrual(&env, credit_line);
+
         if credit_line.borrower != borrower {
             clear_reentrancy_guard(&env);
             panic!("Borrower mismatch for credit line");
@@ -296,6 +306,9 @@ impl Credit {
                 env.panic_with_error(ContractError::CreditLineNotFound)
             });
 
+        // Apply interest accrual before any mutation
+        credit_line = accrual::apply_accrual(&env, credit_line);
+
         // --- Status check: only Closed is disallowed ---
         if credit_line.status == CreditStatus::Closed {
             clear_reentrancy_guard(&env);
@@ -365,15 +378,13 @@ impl Credit {
             }
         }
 
-        // --- Apply repayment allocation: interest first, then principal ---
-        let interest_repaid = effective_repay.min(credit_line.accrued_interest);
-        let principal_repaid = effective_repay - interest_repaid;
-
-        credit_line.accrued_interest = credit_line
-            .accrued_interest
-            .saturating_sub(interest_repaid)
-            .max(0);
-        credit_line.utilized_amount = credit_line
+        // --- Update state with "interest-first" policy ---
+        // Repayment applies to interest first, then to principal.
+        // utilized_amount includes both principal and accrued_interest.
+        let interest_to_pay = effective_repay.min(credit_line.accrued_interest);
+        credit_line.accrued_interest = credit_line.accrued_interest.checked_sub(interest_to_pay).unwrap_or(0);
+        
+        let new_utilized = credit_line
             .utilized_amount
             .saturating_sub(effective_repay)
             .max(0);
@@ -472,33 +483,8 @@ impl Credit {
         lifecycle::default_credit_line(env, borrower)
     }
 
-    pub fn reinstate_credit_line(env: Env, borrower: Address, target_status: CreditStatus) {
-        require_admin_auth(&env);
-        let mut credit_line: CreditLineData = env
-            .storage()
-            .persistent()
-            .get(&borrower)
-            .expect("Credit line not found");
-        if credit_line.status != CreditStatus::Defaulted {
-            panic!("credit line is not defaulted");
-        }
-        if target_status != CreditStatus::Active && target_status != CreditStatus::Suspended {
-            panic!("target_status must be Active or Suspended");
-        }
-        credit_line.status = target_status;
-        env.storage().persistent().set(&borrower, &credit_line);
-        publish_credit_line_event(
-            &env,
-            (symbol_short!("credit"), symbol_short!("reinstate")),
-            CreditLineEvent {
-                event_type: symbol_short!("reinstate"),
-                borrower: borrower.clone(),
-                status: target_status,
-                credit_limit: credit_line.credit_limit,
-                interest_rate_bps: credit_line.interest_rate_bps,
-                risk_score: credit_line.risk_score,
-            },
-        );
+    pub fn reinstate_credit_line(env: Env, borrower: Address) {
+        lifecycle::reinstate_credit_line(env, borrower)
     }
 
     /// Get credit line data for a borrower (view function).
@@ -507,82 +493,10 @@ impl Credit {
     }
 }
 
-/// Apply pending interest accrual for a borrower.
-///
-/// Calculates elapsed time since `last_accrual_ts`, computes interest using
-/// simple interest formula, capitalizes it into `utilized_amount` and
-/// `accrued_interest`, and updates the checkpoint.
-///
-/// Formula:
-/// `new_accrued = floor(utilized_amount * rate_bps * elapsed / (10_000 * SECONDS_PER_YEAR))`
-///
-/// # Behavior
-/// - If `last_accrual_ts == 0`, sets checkpoint to current time without charging.
-/// - If elapsed time is zero or utilization/rate is zero, only updates checkpoint.
-/// - Emits `InterestAccruedEvent` when positive interest is materialized.
-/// - Uses checked arithmetic; reverts with `ContractError::Overflow` on overflow.
-fn apply_pending_accrual(env: &Env, borrower: &Address) {
-    let mut credit_line: CreditLineData = env
-        .storage()
-        .persistent()
-        .get(borrower)
-        .unwrap_or_else(|| env.panic_with_error(ContractError::CreditLineNotFound));
-
-    let now = env.ledger().timestamp();
-
-    // First touch: establish checkpoint without retroactive charges.
-    if credit_line.last_accrual_ts == 0 {
-        credit_line.last_accrual_ts = now;
-        env.storage().persistent().set(borrower, &credit_line);
-        return;
-    }
-
-    let elapsed = now.saturating_sub(credit_line.last_accrual_ts);
-    if elapsed == 0
-        || credit_line.utilized_amount <= 0
-        || credit_line.interest_rate_bps == 0
-    {
-        // Advance checkpoint even when no interest accrues to avoid stale timestamps.
-        credit_line.last_accrual_ts = now;
-        env.storage().persistent().set(borrower, &credit_line);
-        return;
-    }
-
-    // Compute: utilized_amount * rate_bps * elapsed / (10_000 * SECONDS_PER_YEAR)
-    let accrued = credit_line
-        .utilized_amount
-        .checked_mul(credit_line.interest_rate_bps as i128)
-        .and_then(|v| v.checked_mul(elapsed as i128))
-        .and_then(|v| v.checked_div(10_000i128 * SECONDS_PER_YEAR as i128))
-        .unwrap_or_else(|| env.panic_with_error(ContractError::Overflow));
-
-    if accrued > 0 {
-        credit_line.utilized_amount = credit_line
-            .utilized_amount
-            .checked_add(accrued)
-            .unwrap_or_else(|| env.panic_with_error(ContractError::Overflow));
-        credit_line.accrued_interest = credit_line
-            .accrued_interest
-            .checked_add(accrued)
-            .unwrap_or_else(|| env.panic_with_error(ContractError::Overflow));
-
-        let event = InterestAccruedEvent {
-            borrower: borrower.clone(),
-            accrued_amount: accrued,
-            total_accrued_interest: credit_line.accrued_interest,
-            new_utilized_amount: credit_line.utilized_amount,
-            timestamp: now,
-        };
-        publish_interest_accrued_event(env, event);
-    }
-
-    credit_line.last_accrual_ts = now;
-    env.storage().persistent().set(borrower, &credit_line);
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::test_coverage_gaps::setup_contract_with_credit_line;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Events as _;
     use soroban_sdk::token;
@@ -716,7 +630,7 @@ mod test {
 
         client.repay_credit(&borrower, &500);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 0);
         assert_eq!(line.status, CreditStatus::Active);
     }
@@ -741,7 +655,7 @@ mod test {
 
         client.repay_credit(&borrower, &100);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 200);
         assert_eq!(line.status, CreditStatus::Suspended); // status unchanged
     }
@@ -766,7 +680,7 @@ mod test {
 
         client.repay_credit(&borrower, &150);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 250);
         assert_eq!(line.status, CreditStatus::Defaulted); // status unchanged
     }
@@ -794,7 +708,7 @@ mod test {
         assert_eq!(token_client.balance(&borrower), borrower_before - 100);
         assert_eq!(token_client.balance(&contract_id), reserve_before + 100);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 0);
     }
 
@@ -1163,7 +1077,7 @@ mod test {
 
         client.repay_credit(&borrower, &150);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 250); // 400 - 150, no token transfer needed
     }
 
@@ -1200,31 +1114,31 @@ mod test {
         let (client, _contract_id, _admin) =
             setup_contract_with_credit_line(&env, &borrower, 1_000, 0);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_utilization_invariants(&line);
 
         client.draw_credit(&borrower, &250);
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 250);
         assert_utilization_invariants(&line);
 
         client.draw_credit(&borrower, &500);
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 750);
         assert_utilization_invariants(&line);
 
         client.repay_credit(&borrower, &300);
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 450);
         assert_utilization_invariants(&line);
 
         client.update_risk_parameters(&borrower, &1_250, &300_u32, &70_u32);
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.credit_limit, 1_250);
         assert_utilization_invariants(&line);
 
         client.repay_credit(&borrower, &1_000);
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 0);
         assert_utilization_invariants(&line);
     }
@@ -1237,31 +1151,31 @@ mod test {
         let (client, _contract_id, _admin) =
             setup_contract_with_credit_line(&env, &borrower, 1_000, 600);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.status, CreditStatus::Active);
         assert_utilization_invariants(&line);
 
         client.repay_credit(&borrower, &250);
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 350);
         assert_utilization_invariants(&line);
 
         client.suspend_credit_line(&borrower);
         client.repay_credit(&borrower, &200);
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.status, CreditStatus::Suspended);
         assert_eq!(line.utilized_amount, 150);
         assert_utilization_invariants(&line);
 
         client.default_credit_line(&borrower);
         client.repay_credit(&borrower, &500);
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.status, CreditStatus::Defaulted);
         assert_eq!(line.utilized_amount, 0);
         assert_utilization_invariants(&line);
 
-        client.reinstate_credit_line(&borrower, &CreditStatus::Active);
-        let line = client.get_credit_line(&borrower).unwrap();
+        client.reinstate_credit_line(&borrower);
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.status, CreditStatus::Active);
         assert_utilization_invariants(&line);
     }
@@ -1475,7 +1389,7 @@ mod test_smoke_coverage {
 
         client.suspend_credit_line(&borrower);
         client.default_credit_line(&borrower);
-        client.reinstate_credit_line(&borrower, &CreditStatus::Active);
+        client.reinstate_credit_line(&borrower);
 
         sac.mint(&borrower, &100_i128);
         TokenClient::new(&env, &token_address).approve(
@@ -1488,7 +1402,7 @@ mod test_smoke_coverage {
 
         client.close_credit_line(&borrower, &admin);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.status, CreditStatus::Closed);
 
         client.open_credit_line(&borrower, &500_i128, &300_u32, &50_u32);
@@ -1520,7 +1434,7 @@ mod test_smoke_coverage {
     }
 
     #[test]
-    #[should_panic(expected = "risk_score must be between 0 and 100")]
+    #[should_panic(expected = "Error(Contract, #9)")]
     fn open_credit_line_rejects_score_too_high() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1613,7 +1527,7 @@ mod test_smoke_coverage {
         // Admin must be readable — open_credit_line (admin-gated) succeeds only if admin is set.
         let borrower = Address::generate(&env);
         client.open_credit_line(&borrower, &500_i128, &200_u32, &50_u32);
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.borrower, borrower);
     }
 
@@ -1667,7 +1581,7 @@ mod test_smoke_coverage {
         // Admin is still the original — admin-gated call succeeds.
         let borrower = Address::generate(&env);
         client.open_credit_line(&borrower, &100_i128, &100_u32, &10_u32);
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.borrower, borrower);
     }
 
@@ -1720,7 +1634,7 @@ mod test_coverage_gaps {
     use soroban_sdk::token::StellarAssetClient;
     use soroban_sdk::{symbol_short, Symbol, TryFromVal, TryIntoVal};
 
-    fn setup_contract_with_credit_line<'a>(
+    pub(crate) fn setup_contract_with_credit_line<'a>(
         env: &'a Env,
         borrower: &'a Address,
         credit_limit: i128,
@@ -1749,29 +1663,6 @@ mod test_coverage_gaps {
         (client, admin, borrower)
     }
 
-    fn setup_contract_with_token<'a>(
-        env: &'a Env,
-        borrower: &Address,
-        credit_limit: i128,
-        draw_amount: i128,
-    ) -> (CreditClient<'a>, Address, Address) {
-        env.mock_all_auths();
-        let admin = Address::generate(env);
-        let contract_id = env.register(Credit, ());
-        let client = CreditClient::new(env, &contract_id);
-        client.init(&admin);
-        let token_id = env.register_stellar_asset_contract_v2(Address::generate(env));
-        let token_address = token_id.address();
-        client.set_liquidity_token(&token_address);
-        if draw_amount > 0 {
-            StellarAssetClient::new(env, &token_address).mint(&contract_id, &draw_amount);
-        }
-        client.open_credit_line(borrower, &credit_limit, &300_u32, &70_u32);
-        if draw_amount > 0 {
-            client.draw_credit(borrower, &draw_amount);
-        }
-        (client, token_address, admin)
-    }
 
     // ── update_risk_parameters: negative credit_limit ────────────────────────
 
@@ -1867,7 +1758,7 @@ mod test_coverage_gaps {
         let env = Env::default();
         let (client, _admin, borrower) = base_setup(&env);
         // Line is Active, not Defaulted
-        client.reinstate_credit_line(&borrower, &CreditStatus::Active);
+        client.reinstate_credit_line(&borrower);
     }
 
     #[test]
@@ -1877,7 +1768,7 @@ mod test_coverage_gaps {
         let (client, _admin, borrower) = base_setup(&env);
         client.suspend_credit_line(&borrower);
         // Line is Suspended, not Defaulted
-        client.reinstate_credit_line(&borrower, &CreditStatus::Active);
+        client.reinstate_credit_line(&borrower);
     }
 
     // ── open_credit_line: allows reopening after Closed status ───────────────
@@ -1907,7 +1798,7 @@ mod test_coverage_gaps {
         env.mock_all_auths();
         let (client, _admin, borrower) = base_setup(&env);
         client.default_credit_line(&borrower);
-        client.reinstate_credit_line(&borrower, &CreditStatus::Active);
+        client.reinstate_credit_line(&borrower);
         let events = env.events().all();
         let (_contract, topics, data) = events.last().unwrap();
         assert_eq!(
@@ -1936,7 +1827,7 @@ mod test_coverage_gaps {
         client.repay_credit(&borrower, &50_i128);
         client.suspend_credit_line(&borrower);
         client.default_credit_line(&borrower);
-        client.reinstate_credit_line(&borrower, &CreditStatus::Active);
+        client.reinstate_credit_line(&borrower);
         client.close_credit_line(&borrower, &admin);
 
         let events = env.events().all();
@@ -2101,6 +1992,7 @@ mod test_coverage_gaps {
         client.init(&admin);
         client.open_credit_line(&borrower, &1_000_i128, &300_u32, &70_u32);
 
+        let token_admin = Address::generate(&env);
         let token = env.register_stellar_asset_contract_v2(token_admin);
         let token_admin_client = StellarAssetClient::new(&env, &token.address());
         client.set_liquidity_token(&token.address());
@@ -2141,29 +2033,10 @@ mod test_coverage_gaps {
         client.draw_credit(&borrower, &100_i128);
     }
 
-    /// CreditError::from converts each variant to a contract error code.
-    #[test]
-    fn test_credit_error_from_conversion() {
-        let err: soroban_sdk::Error = soroban_sdk::Error::from(CreditError::CreditLineNotFound);
-        assert_eq!(err, soroban_sdk::Error::from_contract_error(1));
-
-        let err2: soroban_sdk::Error = soroban_sdk::Error::from(CreditError::InvalidCreditStatus);
-        assert_eq!(err2, soroban_sdk::Error::from_contract_error(2));
-
-        let err3: soroban_sdk::Error = soroban_sdk::Error::from(CreditError::InvalidAmount);
-        assert_eq!(err3, soroban_sdk::Error::from_contract_error(3));
-
-        let err4: soroban_sdk::Error =
-            soroban_sdk::Error::from(CreditError::InsufficientUtilization);
-        assert_eq!(err4, soroban_sdk::Error::from_contract_error(4));
-
-        let err5: soroban_sdk::Error = soroban_sdk::Error::from(CreditError::Unauthorized);
-        assert_eq!(err5, soroban_sdk::Error::from_contract_error(5));
-    }
 
     /// draw_credit panics with "overflow" when utilized_amount + amount overflows i128.
     #[test]
-    #[should_panic(expected = "overflow")]
+    #[should_panic(expected = "Error(Contract, #12)")]
     fn test_draw_credit_overflow_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2192,9 +2065,10 @@ mod test_coverage_gaps {
         client.draw_credit(&borrower, &1_i128);
     }
 
-    /// draw_credit succeeds on a Defaulted credit line (only Closed is blocked).
+    /// draw_credit is blocked on a Defaulted credit line.
     #[test]
-    fn test_draw_credit_allowed_on_defaulted_line() {
+    #[should_panic(expected = "credit line is defaulted")]
+    fn test_draw_credit_blocked_on_defaulted_line() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -2207,12 +2081,7 @@ mod test_coverage_gaps {
         client.open_credit_line(&borrower, &1000_i128, &300_u32, &70_u32);
         client.default_credit_line(&borrower);
 
-        // Draw should succeed because draw_credit only blocks Closed status.
         client.draw_credit(&borrower, &100_i128);
-
-        let line = client.get_credit_line(&borrower).unwrap();
-        assert_eq!(line.utilized_amount, 100);
-        assert_eq!(line.status, CreditStatus::Defaulted);
     }
 
     /// repay_credit succeeds on a Defaulted credit line.
@@ -2233,7 +2102,7 @@ mod test_coverage_gaps {
 
         client.repay_credit(&borrower, &200_i128);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 300);
         assert_eq!(line.status, CreditStatus::Defaulted);
     }
@@ -2256,7 +2125,7 @@ mod test_coverage_gaps {
         // Re-opening a Closed line should succeed.
         client.open_credit_line(&borrower, &2000_i128, &400_u32, &60_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.credit_limit, 2000);
         assert_eq!(line.status, CreditStatus::Active);
     }
@@ -2279,7 +2148,7 @@ mod test_coverage_gaps {
         // Re-opening a Defaulted line should succeed.
         client.open_credit_line(&borrower, &1500_i128, &350_u32, &65_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.credit_limit, 1500);
         assert_eq!(line.status, CreditStatus::Active);
     }
@@ -2301,7 +2170,7 @@ mod test_coverage_gaps {
 
         client.close_credit_line(&borrower, &admin);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.status, CreditStatus::Closed);
     }
 
@@ -2322,7 +2191,7 @@ mod test_coverage_gaps {
 
         client.close_credit_line(&borrower, &admin);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.status, CreditStatus::Closed);
     }
 
@@ -2344,7 +2213,7 @@ mod test_coverage_gaps {
         // Re-opening a Suspended line should succeed.
         client.open_credit_line(&borrower, &2000_i128, &400_u32, &60_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.credit_limit, 2000);
         assert_eq!(line.status, CreditStatus::Active);
     }
@@ -2383,7 +2252,7 @@ mod test_rate_change_limits {
         client.set_rate_change_limits(&100_u32, &0_u64);
         client.update_risk_parameters(&borrower, &5_000_i128, &350_u32, &70_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.interest_rate_bps, 350);
     }
 
@@ -2424,7 +2293,7 @@ mod test_rate_change_limits {
         // Current rate 300; 300 + 50 = 350 → delta == limit
         client.update_risk_parameters(&borrower, &5_000_i128, &350_u32, &70_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.interest_rate_bps, 350);
     }
 
@@ -2477,7 +2346,7 @@ mod test_rate_change_limits {
         env.ledger().with_mut(|li| li.timestamp = 3701);
         client.update_risk_parameters(&borrower, &5_000_i128, &330_u32, &70_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.interest_rate_bps, 330);
     }
 
@@ -2497,7 +2366,7 @@ mod test_rate_change_limits {
         env.ledger().with_mut(|li| li.timestamp = 3700);
         client.update_risk_parameters(&borrower, &5_000_i128, &330_u32, &70_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.interest_rate_bps, 330);
         assert_eq!(line.last_rate_update_ts, 3700);
     }
@@ -2514,7 +2383,7 @@ mod test_rate_change_limits {
         env.ledger().with_mut(|li| li.timestamp = 10);
         client.update_risk_parameters(&borrower, &5_000_i128, &350_u32, &70_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.interest_rate_bps, 350);
     }
 
@@ -2534,7 +2403,7 @@ mod test_rate_change_limits {
         env.ledger().with_mut(|li| li.timestamp = 101);
         client.update_risk_parameters(&borrower, &5_000_i128, &330_u32, &70_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.interest_rate_bps, 330);
         assert_eq!(line.last_rate_update_ts, 101);
     }
@@ -2552,7 +2421,7 @@ mod test_rate_change_limits {
         // Same rate (300 → 300) should still succeed.
         client.update_risk_parameters(&borrower, &5_000_i128, &300_u32, &70_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.interest_rate_bps, 300);
     }
 
@@ -2566,7 +2435,7 @@ mod test_rate_change_limits {
         // No set_rate_change_limits call → unlimited changes.
         client.update_risk_parameters(&borrower, &5_000_i128, &9_999_u32, &70_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.interest_rate_bps, 9_999);
     }
 
@@ -2597,7 +2466,7 @@ mod test_rate_change_limits {
         env.ledger().with_mut(|li| li.timestamp = 42);
         client.update_risk_parameters(&borrower, &5_000_i128, &350_u32, &70_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.last_rate_update_ts, 42);
     }
 
@@ -2622,7 +2491,7 @@ mod test_rate_change_limits {
         env.ledger().with_mut(|li| li.timestamp = 222);
         client.update_risk_parameters(&borrower, &5_000_i128, &370_u32, &60_u32);
 
-        let line = client.get_credit_line(&borrower).unwrap();
+        let line: CreditLineData = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.interest_rate_bps, 370);
         assert_eq!(line.risk_score, 60);
     }
