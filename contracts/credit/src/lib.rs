@@ -56,7 +56,9 @@ fn admin_key(env: &Env) -> Symbol {
 pub mod types;
 
 use crate::events::{publish_drawn_event, publish_repayment_event, DrawnEvent, RepaymentEvent};
+use crate::events::{publish_borrower_blocked_event, BorrowerBlockedEvent};
 use crate::storage::{clear_reentrancy_guard, set_reentrancy_guard, DataKey};
+use crate::storage::{is_borrower_blocked, set_borrower_blocked};
 use crate::types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
 use soroban_sdk::{contract, contractimpl, token, Address, Env};
 
@@ -182,6 +184,11 @@ impl Credit {
     pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {
         set_reentrancy_guard(&env);
         borrower.require_auth();
+
+        if is_borrower_blocked(&env, &borrower) {
+            clear_reentrancy_guard(&env);
+            env.panic_with_error(ContractError::BorrowerBlocked);
+        }
 
         if amount <= 0 {
             clear_reentrancy_guard(&env);
@@ -491,6 +498,34 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
+    }
+
+    /// Block or unblock a borrower from drawing credit (admin only).
+    ///
+    /// # Parameters
+    /// - `borrower`: The borrower's address.
+    /// - `blocked`: `true` to block, `false` to unblock.
+    ///
+    /// # Security
+    /// - Only callable by the contract admin.
+    /// - Does not modify the borrower's [`CreditStatus`] or credit line data.
+    pub fn set_borrower_blocked(env: Env, borrower: Address, blocked: bool) {
+        require_admin_auth(&env);
+        set_borrower_blocked(&env, &borrower, blocked);
+        publish_borrower_blocked_event(
+            &env,
+            BorrowerBlockedEvent {
+                borrower: borrower.clone(),
+                blocked,
+            },
+        );
+    }
+
+    /// Query whether a borrower is currently blocked from drawing credit.
+    ///
+    /// Returns `false` if no block record exists for the address.
+    pub fn is_borrower_blocked(env: Env, borrower: Address) -> bool {
+        is_borrower_blocked(&env, &borrower)
     }
 }
 
@@ -1306,6 +1341,7 @@ mod test_smoke_coverage {
         let _ = ContractError::Overflow;
         let _ = ContractError::Reentrancy;
         let _ = ContractError::AlreadyInitialized;
+        let _ = ContractError::BorrowerBlocked;
 
         // Trigger a few more error paths
         let admin = Address::generate(&env);
@@ -2356,5 +2392,155 @@ mod test_rate_change_limits {
         client.init(&admin);
 
         client.set_rate_change_limits(&100_u32, &0_u64);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests: borrower blocklist gating
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod test_borrower_blocklist {
+    use super::*;
+    use crate::events::BorrowerBlockedEvent;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::token;
+    use soroban_sdk::token::StellarAssetClient;
+    use soroban_sdk::{symbol_short, Symbol, TryFromVal, TryIntoVal};
+
+    fn setup_with_token<'a>(
+        env: &'a Env,
+        borrower: &'a Address,
+        credit_limit: i128,
+        reserve_amount: i128,
+    ) -> (CreditClient<'a>, Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(env, &contract_id);
+        client.init(&admin);
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(env));
+        let token_address = token_id.address();
+        client.set_liquidity_token(&token_address);
+        if reserve_amount > 0 {
+            StellarAssetClient::new(env, &token_address).mint(&contract_id, &reserve_amount);
+        }
+        client.open_credit_line(borrower, &credit_limit, &300_u32, &70_u32);
+        (client, token_address, admin)
+    }
+
+    /// Admin can block a borrower; query reflects the change.
+    #[test]
+    fn block_and_unblock_round_trip() {
+        let env = Env::default();
+        let borrower = Address::generate(&env);
+        let (client, _token, _admin) = setup_with_token(&env, &borrower, 1_000, 0);
+
+        assert!(!client.is_borrower_blocked(&borrower));
+
+        client.set_borrower_blocked(&borrower, &true);
+        assert!(client.is_borrower_blocked(&borrower));
+
+        client.set_borrower_blocked(&borrower, &false);
+        assert!(!client.is_borrower_blocked(&borrower));
+    }
+
+    /// Blocked borrower cannot draw credit.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #15)")]
+    fn blocked_borrower_draw_reverts() {
+        let env = Env::default();
+        let borrower = Address::generate(&env);
+        let (client, _token, _admin) = setup_with_token(&env, &borrower, 1_000, 1_000);
+
+        client.set_borrower_blocked(&borrower, &true);
+        client.draw_credit(&borrower, &100);
+    }
+
+    /// Unblocked borrower can draw credit after being blocked.
+    #[test]
+    fn unblocked_borrower_can_draw() {
+        let env = Env::default();
+        let borrower = Address::generate(&env);
+        let (client, _token, _admin) = setup_with_token(&env, &borrower, 1_000, 1_000);
+
+        client.set_borrower_blocked(&borrower, &true);
+        assert!(client.is_borrower_blocked(&borrower));
+
+        client.set_borrower_blocked(&borrower, &false);
+        assert!(!client.is_borrower_blocked(&borrower));
+
+        client.draw_credit(&borrower, &200);
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.utilized_amount, 200);
+    }
+
+    /// Repayment remains allowed while borrower is blocked.
+    #[test]
+    fn repay_allowed_while_blocked() {
+        let env = Env::default();
+        let borrower = Address::generate(&env);
+        let (client, token, contract_id, _admin) = setup_with_token(&env, &borrower, 1_000, 1_000);
+
+        client.draw_credit(&borrower, &300);
+        client.set_borrower_blocked(&borrower, &true);
+        assert!(client.is_borrower_blocked(&borrower));
+
+        StellarAssetClient::new(&env, &token).mint(&borrower, &100);
+        token::Client::new(&env, &token).approve(
+            &borrower,
+            &contract_id,
+            &100_i128,
+            &1000_u32,
+        );
+
+        client.repay_credit(&borrower, &100);
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.utilized_amount, 200);
+        assert_eq!(line.status, CreditStatus::Active);
+    }
+
+    /// Non-admin cannot call set_borrower_blocked.
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn set_borrower_blocked_non_admin_reverts() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+        // No mock_all_auths → admin auth will fail.
+        client.set_borrower_blocked(&borrower, &true);
+    }
+
+    /// Event is emitted with correct payload when blocking and unblocking.
+    #[test]
+    fn block_unblock_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        client.set_borrower_blocked(&borrower, &true);
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+        let topic1: Symbol = Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+        assert_eq!(topic1, symbol_short!("blocked"));
+        let event: BorrowerBlockedEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event.borrower, borrower);
+        assert!(event.blocked);
+
+        client.set_borrower_blocked(&borrower, &false);
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+        let topic1: Symbol = Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+        assert_eq!(topic1, Symbol::new(&env, "unblocked"));
+        let event: BorrowerBlockedEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event.borrower, borrower);
+        assert!(!event.blocked);
     }
 }
