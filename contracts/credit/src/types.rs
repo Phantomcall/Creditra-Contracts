@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![cfg_attr(coverage_nightly, coverage(off))]
 
-//! Core data types for the Credit contract.
+//! Core data types for the Creditra contract.
 
 use soroban_sdk::{contracttype, Address};
 
@@ -53,16 +55,19 @@ pub enum ContractError {
     LimitDecreaseRequiresRepayment = 13,
     /// Contract has already been initialized; `init` may only be called once.
     AlreadyInitialized = 14,
-    /// Per-transaction draw cap exceeded.
-    DrawExceedsMaxAmount = 15,
-    /// Admin acceptance attempted before the required delay has elapsed.
-    AdminAcceptTooEarly = 16,
+    /// All draws are globally frozen by admin for liquidity reserve operations.
+    DrawsFrozen = 15,
+    /// The requested draw exceeds the configured per-transaction maximum.
+    DrawExceedsMaxAmount = 16,
     /// Borrower is blocked from drawing credit.
     BorrowerBlocked = 17,
+    /// Admin acceptance attempted before the delay window has elapsed.
+    AdminAcceptTooEarly = 18,
 }
 
 /// Stored credit line data for a borrower.
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreditLineData {
     /// Address of the borrower.
     pub borrower: Address,
@@ -95,6 +100,7 @@ pub struct RateChangeConfig {
     pub max_rate_change_bps: u32,
     /// Minimum elapsed seconds between two consecutive rate changes.
     pub rate_change_min_interval: u64,
+}
 }
 
 /// Admin-configurable piecewise-linear rate formula.

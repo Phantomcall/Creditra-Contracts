@@ -17,6 +17,13 @@ pub const MAX_INTEREST_RATE_BPS: u32 = 10_000;
 /// Maximum risk score (0–100 scale).
 pub const MAX_RISK_SCORE: u32 = 100;
 
+/// Retrieve the rate formula config from instance storage, if set.
+pub fn get_rate_formula_config(env: Env) -> Option<RateFormulaConfig> {
+    env.storage()
+        .instance()
+        .get::<_, RateFormulaConfig>(&rate_formula_key(&env))
+}
+
 /// Compute interest rate from risk score using piecewise-linear formula.
 ///
 /// # Formula
@@ -145,4 +152,11 @@ pub fn update_risk_parameters(
             risk_score,
         },
     );
+}
+
+/// Retrieve the rate formula configuration from instance storage, if set.
+pub fn get_rate_formula_config(env: Env) -> Option<RateFormulaConfig> {
+    env.storage()
+        .instance()
+        .get::<_, RateFormulaConfig>(&rate_formula_key(&env))
 }

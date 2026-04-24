@@ -297,40 +297,26 @@ Emits: `("credit", "reinstate")` event.
 ### `get_credit_line(env, borrower) -> Option<CreditLineData>`
 View function — returns credit line data or `None`.
 
-### `get_contract_version(env) -> ContractVersion`
-View function — returns the contract's API version as a `ContractVersion { major, minor, patch }` struct.
+### `freeze_draws(env)`
+Freeze all `draw_credit` calls contract-wide (admin only).
 
-Use this to let off-chain clients (wallets, indexers, integration services) detect the deployed contract's API surface without introspecting code or storage.
+- Sets `DataKey::DrawsFrozen` to `true` in instance storage.
+- Does **not** mutate any borrower's `CreditStatus`; lines remain Active, Defaulted, etc.
+- Repayments are never blocked by this flag.
+- Idempotent: calling when already frozen still emits the event.
 
-#### Return type
+Emits: `("credit", "drw_freeze")` with `DrawsFrozenEvent { frozen: true, timestamp, actor }`.
 
-| Field   | Type  | Description |
-|---------|-------|-------------|
-| `major` | `u32` | Incremented on breaking ABI / storage layout changes |
-| `minor` | `u32` | Incremented on additive, backward-compatible changes |
-| `patch` | `u32` | Incremented on internal fixes with no API impact |
+### `unfreeze_draws(env)`
+Re-enable `draw_credit` after a global freeze (admin only).
 
-The underlying source of truth is the crate-level constant `CONTRACT_API_VERSION: (u32, u32, u32)` in `contracts/credit/src/lib.rs`. The query is read-only, requires no authorization, and reads no storage — it is safe to poll.
+- Sets `DataKey::DrawsFrozen` to `false` in instance storage.
+- Idempotent: calling when already unfrozen still emits the event.
 
-#### Current value
+Emits: `("credit", "drw_freeze")` with `DrawsFrozenEvent { frozen: false, timestamp, actor }`.
 
-`(1, 0, 0)` — the initial stable release.
-
-#### Versioning policy
-
-- **Major bump** — any change that breaks existing integrations: removing or renaming a contract method, changing a method's argument types or return type, removing or renumbering an `Event`, renumbering a `ContractError` variant, or changing a persistent storage key layout.
-- **Minor bump** — adding a new method, a new event variant, a new error code at a fresh discriminant, or a new optional field on a versioned event struct.
-- **Patch bump** — internal behavior fixes that do not alter the ABI, event schema, error codes, or storage layout.
-
-Integrators should treat the tuple as the canonical compatibility signal: compare `major` for hard compatibility gates and use `minor` / `patch` for feature detection and observability.
-
-#### Example (TypeScript client)
-
-```ts
-const v = await client.getContractVersion();
-if (v.major !== 1) throw new Error(`unsupported credit contract major: ${v.major}`);
-logger.info({ version: `${v.major}.${v.minor}.${v.patch}` }, 'credit contract version');
-```
+### `is_draws_frozen(env) -> bool`
+Returns `true` when draws are globally frozen. Defaults to `false` when the key has never been set. No auth required.
 
 ---
 
@@ -386,6 +372,7 @@ The `Credit` contract uses standard `u32` discriminants for standardized error h
 | `12`       | `Overflow`           | Math overflow occurred during calculation.                                  |
 | `13`       | `LimitDecreaseRequiresRepayment` | Credit limit decrease requires immediate repayment of excess amount. |
 | `14`       | `AlreadyInitialized` | Contract has already been initialized; `init` may only be called once.      |
+| `15`       | `DrawsFrozen` | All draws are globally frozen by admin for liquidity reserve operations.    |
 
 ---
 
@@ -402,6 +389,7 @@ The `Credit` contract uses standard `u32` discriminants for standardized error h
 | `("credit", "default")`    | `default`  | `default_credit_line`       | Line defaulted |
 | `("credit", "reinstate")`  | `reinstate`| `reinstate_credit_line`     | Line reinstated |
 | `("credit", "risk_updated")`| `risk_updated` | `update_risk_parameters` | Risk parameters changed |
+| `("credit", "drw_freeze")` | `DrawsFrozenEvent` | `freeze_draws`, `unfreeze_draws` | Global draw freeze toggled |
 
 The contract also emits additive v2 event topics (for indexer analytics fields
 like actor/source/timestamp identifiers) while keeping v1 payloads stable. See
@@ -427,6 +415,9 @@ like actor/source/timestamp identifiers) while keeping v1 payloads stable. See
 | `set_rate_change_limits` | Admin                 |
 | `get_rate_change_limits` | Anyone (view)         |
 | `get_credit_line`        | Anyone (view)         |
+| `freeze_draws`           | Admin                 |
+| `unfreeze_draws`         | Admin                 |
+| `is_draws_frozen`        | Anyone (view)         |
 
 > Note: `open_credit_line` requires admin authorization (`require_auth`). The admin key is the backend/risk engine signer — borrowers cannot open their own credit lines.
 
@@ -960,6 +951,7 @@ these keys are lost. Production deployments should call
 | `DataKey::LiquiditySource` | `DataKey` | `Address` | `init`, `set_liquidity_source` | Reserve address. Defaults to contract address. |
 | `Symbol("reentrancy")` | `Symbol` | `bool` | `set_reentrancy_guard`, `clear_reentrancy_guard` | Defense-in-depth flag. Cleared on every code path. |
 | `Symbol("rate_cfg")` | `Symbol` | `RateChangeConfig` | `set_rate_change_limits` | Admin-configurable rate-change governance. |
+| `DataKey::DrawsFrozen` | `DataKey` | `bool` | `freeze_draws`, `unfreeze_draws` | Global emergency draw freeze. Absent = `false` (draws allowed). |
 
 **Why instance?** These are global singleton configuration values. There is
 exactly one admin, one liquidity token, one liquidity source, and one rate
@@ -997,6 +989,9 @@ Instance storage works correctly today because it is always cleared.
 7. **TTL management** — not yet implemented. Recommend adding
    `extend_ttl()` calls on instance (in `init` or a dedicated `bump` endpoint)
    and on persistent (on credit line access) before production deployment.
+8. **DrawsFrozen** — correctly on instance. Global singleton flag; absent key
+   is treated as `false` (draws allowed). Shares instance TTL — extend alongside
+   other instance keys.
 
 You can also run all workspace tests from the repository root with `cargo test`.
 
@@ -1023,8 +1018,9 @@ This section documents all contract errors and their exact error codes for consi
 | 11 | `Reentrancy` | Reentrancy detected during cross-contract calls | Reentrancy guard |
 | 12 | `Overflow` | Math overflow occurred during calculation | Arithmetic operations |
 | 13 | `LimitDecreaseRequiresRepayment` | Credit limit decrease requires immediate repayment of excess amount | Limit decrease validation |
-| 14 | `AlreadyInitialized` | Contract has already been initialized; `init` may only be called once | Initialization guard |
-| 15 | `BorrowerBlocked` | Borrower is blocked from drawing credit | Borrower blocklist enforcement |
+| 14 | `AlreadyInitialized` | Contract has already been initialized; `init` may only be called once | Second `init` call |
+| 15 | `DrawsFrozen` | All draws are globally frozen by admin for liquidity reserve operations | `draw_credit` when `DataKey::DrawsFrozen` is `true` |
+| 16 | `DrawExceedsMaxAmount` | The requested draw exceeds the configured per-transaction maximum | `draw_credit` when `DataKey::MaxDrawAmount` is set |
 
 ### Rate and Score Validation
 
