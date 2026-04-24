@@ -215,6 +215,12 @@ impl Credit {
             env.panic_with_error(ContractError::DrawsFrozen);
         }
 
+        // Global emergency freeze: block all draws during liquidity reserve operations.
+        if freeze::is_draws_frozen(&env) {
+            clear_reentrancy_guard(&env);
+            env.panic_with_error(ContractError::DrawsFrozen);
+        }
+
         // Enforce per-transaction draw cap when configured.
         if let Some(max_draw) = env
             .storage()
@@ -1497,9 +1503,18 @@ mod test_smoke_coverage {
         // Trigger a few more error paths
         let admin = Address::generate(&env);
         let borrower = Address::generate(&env);
-        let client = CreditClient::new(&env, &env.register(Credit, ()));
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &500_u32, &60_u32);
+
+        // Cover storage::set_borrower_blocked and is_borrower_blocked
+        env.as_contract(&contract_id, || {
+            crate::storage::set_borrower_blocked(&env, &borrower, true);
+            assert!(crate::storage::is_borrower_blocked(&env, &borrower));
+            crate::storage::set_borrower_blocked(&env, &borrower, false);
+            assert!(!crate::storage::is_borrower_blocked(&env, &borrower));
+        });
     }
 
     // ── init hardening tests ──────────────────────────────────────────────────
