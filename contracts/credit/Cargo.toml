@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Creditra credit line Soroban contract"
 
+[lints]
+workspace = true
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -12,3 +15,4 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+proptest = "1.4"
