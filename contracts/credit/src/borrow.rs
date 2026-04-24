@@ -1,4 +1,4 @@
-use crate::events::{publish_drawn_event, publish_repayment_event, DrawnEvent, RepaymentEvent};
+use crate::events::{publish_drawn_event, DrawnEvent};
 use crate::storage::{clear_reentrancy_guard, set_reentrancy_guard, DataKey};
 use crate::types::{CreditLineData, CreditStatus};
 use soroban_sdk::{token, Address, Env};

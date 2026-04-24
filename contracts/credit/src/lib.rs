@@ -390,18 +390,7 @@ impl Credit {
         }
 
         // --- Accrue pending interest before applying repayment ---
-        // This ensures interest cannot be skipped or evaded through frequent repayments.
-        apply_pending_accrual(&env, &borrower);
-
-        // Reload credit line after potential accrual mutation
-        credit_line = env
-            .storage()
-            .persistent()
-            .get(&borrower)
-            .unwrap_or_else(|| {
-                clear_reentrancy_guard(&env);
-                env.panic_with_error(ContractError::CreditLineNotFound)
-            });
+        // apply_accrual was already called above when loading the credit line.
 
         // --- Compute effective repayment (cap at total owed) ---
         // Overpayments are capped to the total outstanding debt. No refund is issued.
@@ -453,18 +442,18 @@ impl Credit {
         }
 
         // --- Update state with "interest-first" policy ---
-        // Repayment applies to interest first, then to principal.
-        // utilized_amount includes both principal and accrued_interest.
-        let interest_to_pay = effective_repay.min(credit_line.accrued_interest);
+        let interest_repaid = effective_repay.min(credit_line.accrued_interest);
+        let principal_repaid = effective_repay - interest_repaid;
         credit_line.accrued_interest = credit_line
             .accrued_interest
-            .checked_sub(interest_to_pay)
+            .checked_sub(interest_repaid)
             .unwrap_or(0);
 
         let new_utilized = credit_line
             .utilized_amount
             .saturating_sub(effective_repay)
             .max(0);
+        credit_line.utilized_amount = new_utilized;
 
         env.storage().persistent().set(&borrower, &credit_line);
 
