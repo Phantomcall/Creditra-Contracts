@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![cfg_attr(coverage_nightly, coverage(off))]
 
 //! Event types and topic constants for the Credit contract.
 //! Stable event schemas for indexing and analytics.
@@ -132,6 +134,18 @@ pub struct InterestAccruedEvent {
     pub timestamp: u64,
 }
 
+/// Event emitted when the global draws-frozen switch is toggled by admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DrawsFrozenEvent {
+    /// `true` when draws are now frozen; `false` when unfrozen.
+    pub frozen: bool,
+    /// Ledger timestamp of the toggle.
+    pub timestamp: u64,
+    /// Admin address that performed the toggle.
+    pub actor: Address,
+}
+
 /// Versioned draw event with explicit recipient/source identifiers.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,6 +226,14 @@ pub fn publish_interest_accrued_event(env: &Env, event: InterestAccruedEvent) {
         .publish((symbol_short!("credit"), symbol_short!("accrue")), event);
 }
 
+/// Publish a draws-frozen toggle event.
+pub fn publish_draws_frozen_event(env: &Env, event: DrawsFrozenEvent) {
+    env.events().publish(
+        (symbol_short!("credit"), Symbol::new(env, "drw_freeze")),
+        event,
+    );
+}
+
 /// Event emitted when a borrower's block status changes.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,6 +245,7 @@ pub struct BorrowerBlockedEvent {
 }
 
 /// Publish a borrower blocked/unblocked event.
+#[allow(dead_code)]
 pub fn publish_borrower_blocked_event(env: &Env, event: BorrowerBlockedEvent) {
     let topic = if event.blocked {
         symbol_short!("blocked")
@@ -233,10 +256,27 @@ pub fn publish_borrower_blocked_event(env: &Env, event: BorrowerBlockedEvent) {
         .publish((symbol_short!("credit"), topic), event);
 }
 
+/// Event emitted when the rate formula config is set or cleared.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateFormulaConfigEvent {
+    /// `true` when a config was set; `false` when cleared.
+    pub enabled: bool,
+}
+
+/// Publish a rate formula config change event.
+#[allow(dead_code)]
+pub fn publish_rate_formula_config_event(env: &Env, event: RateFormulaConfigEvent) {
+    env.events().publish(
+        (symbol_short!("credit"), Symbol::new(env, "rate_form")),
+        event,
+    );
+}
+
 /// Publish an admin rotation proposed event.
 pub fn publish_admin_rotation_proposed(env: &Env, event: AdminRotationProposedEvent) {
     env.events().publish(
-        (symbol_short!("credit"), Symbol::new(env, "adm_prop")),
+        (symbol_short!("credit"), Symbol::new(env, "admin_prop")),
         event,
     );
 }
@@ -244,29 +284,7 @@ pub fn publish_admin_rotation_proposed(env: &Env, event: AdminRotationProposedEv
 /// Publish an admin rotation accepted event.
 pub fn publish_admin_rotation_accepted(env: &Env, event: AdminRotationAcceptedEvent) {
     env.events().publish(
-        (symbol_short!("credit"), Symbol::new(env, "adm_acc")),
-        event,
-    );
-}
-
-/// Event emitted when the rate formula configuration is updated.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RateFormulaConfigEvent {
-    /// Base rate in basis points.
-    pub base_rate_bps: u32,
-    /// Slope in basis points per risk score unit.
-    pub slope_bps_per_score: u32,
-    /// Minimum rate in basis points.
-    pub min_rate_bps: u32,
-    /// Maximum rate in basis points.
-    pub max_rate_bps: u32,
-}
-
-/// Publish a rate formula configuration event.
-pub fn publish_rate_formula_config_event(env: &Env, event: RateFormulaConfigEvent) {
-    env.events().publish(
-        (symbol_short!("credit"), Symbol::new(env, "rate_form")),
+        (symbol_short!("credit"), Symbol::new(env, "admin_acc")),
         event,
     );
 }

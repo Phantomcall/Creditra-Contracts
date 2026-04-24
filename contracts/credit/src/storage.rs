@@ -9,10 +9,12 @@ pub enum DataKey {
     LiquidityToken,
     /// Address of the liquidity source / reserve that funds draws.
     LiquiditySource,
-    /// Optional per-transaction draw cap (admin-configurable).
+    /// Global emergency switch: when `true`, all `draw_credit` calls revert.
+    /// Does not affect repayments. Distinct from per-line `Suspended` status.
+    DrawsFrozen,
     MaxDrawAmount,
-    /// Persistent flag indicating a borrower is blocked from drawing credit.
-    BlockedBorrower(soroban_sdk::Address),
+    /// Per-borrower block flag; when `true`, draw_credit is rejected.
+    BlockedBorrower(Address),
 }
 
 pub fn admin_key(env: &Env) -> Symbol {
@@ -71,6 +73,7 @@ pub fn is_borrower_blocked(env: &Env, borrower: &Address) -> bool {
 }
 
 /// Set or clear the blocked status for a borrower.
+#[allow(dead_code)]
 pub fn set_borrower_blocked(env: &Env, borrower: &Address, blocked: bool) {
     env.storage()
         .persistent()
