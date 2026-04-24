@@ -7,11 +7,20 @@ use soroban_sdk::Env;
 /// Seconds in a non-leap year (365 days).
 pub(crate) const SECONDS_PER_YEAR: u64 = 31_536_000;
 
-/// Internal function to apply interest accrual to a credit line.
+/// Apply interest accrual to a credit line and return the updated line.
 ///
-/// This function calculates the interest accrued since the last checkpoint,
-/// updates the utilized amount and accrued interest, and emits an event
-/// if interest was materialized.
+/// Reads the optional [`GracePeriodConfig`] from instance storage to determine
+/// the effective rate for Suspended lines within their grace window.
+///
+/// # Grace period interaction
+/// - If the line is Suspended and a grace period policy is configured, the
+///   effective rate is reduced (or zeroed) for the portion of `elapsed` that
+///   falls within the grace window.
+/// - If the grace window expires mid-period, the elapsed time is split: the
+///   in-window portion uses the waiver rate and the post-window portion uses
+///   the full rate.
+/// - If no policy is configured, or the line is not Suspended, normal accrual
+///   applies unchanged.
 pub fn apply_accrual(env: &Env, mut line: CreditLineData) -> CreditLineData {
     let now = env.ledger().timestamp();
 

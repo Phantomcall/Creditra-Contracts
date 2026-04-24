@@ -43,6 +43,7 @@ pub fn suspend_credit_line(env: Env, borrower: Address) {
     }
 
     credit_line.status = CreditStatus::Suspended;
+    credit_line.suspension_ts = env.ledger().timestamp();
     env.storage().persistent().set(&borrower, &credit_line);
 
     publish_credit_line_event(
@@ -289,6 +290,7 @@ pub fn reinstate_credit_line(env: Env, borrower: Address) {
     }
 
     credit_line.status = CreditStatus::Active;
+    credit_line.suspension_ts = 0; // clear grace period anchor on reinstatement
     env.storage().persistent().set(&borrower, &credit_line);
 
     publish_credit_line_event(

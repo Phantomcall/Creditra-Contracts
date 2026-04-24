@@ -117,6 +117,11 @@ pub struct CreditLineData {
     /// Ledger timestamp of the last interest accrual calculation.
     /// Zero means no accrual has been calculated yet.
     pub last_accrual_ts: u64,
+    /// Ledger timestamp when the credit line was most recently suspended.
+    /// Zero when the line has never been suspended or has been reinstated.
+    /// Used by the grace period logic to determine whether the waiver window
+    /// is still active.
+    pub suspension_ts: u64,
 }
 
 /// Admin-configurable limits on interest-rate changes.
