@@ -3216,3 +3216,131 @@ mod test_reentrancy_guard {
         );
     }
 }
+
+#[cfg(test)]
+mod test_draw_reversal_window {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::testutils::Ledger;
+    use soroban_sdk::token::Client as TokenClient;
+    use soroban_sdk::token::StellarAssetClient;
+    use soroban_sdk::{symbol_short, TryFromVal, TryIntoVal};
+
+    fn setup<'a>(
+        env: &'a Env,
+        borrower: &Address,
+        credit_limit: i128,
+        reserve: i128,
+    ) -> (CreditClient<'a>, Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(env, &contract_id);
+        client.init(&admin);
+
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(env));
+        let token_address = token_id.address();
+        client.set_liquidity_token(&token_address);
+        client.set_liquidity_source(&contract_id);
+        if reserve > 0 {
+            StellarAssetClient::new(env, &token_address).mint(&contract_id, &reserve);
+        }
+
+        client.open_credit_line(borrower, &credit_limit, &300_u32, &70_u32);
+        (client, token_address, contract_id)
+    }
+
+    #[test]
+    fn reverse_draw_within_window_succeeds_and_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, _token, _contract_id) = setup(&env, &borrower, 1_000, 1_000);
+
+        env.ledger().set_timestamp(100);
+        client.draw_credit(&borrower, &400);
+
+        env.ledger().set_timestamp(200);
+        client.reverse_draw(&borrower, &150, &100_u64, &10_u32);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.utilized_amount, 250);
+
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+        let topic0 = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        let topic1 = Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+        assert_eq!(topic0, symbol_short!("credit"));
+        assert_eq!(topic1, symbol_short!("draw_rev"));
+
+        let event: DrawReversedEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event.borrower, borrower);
+        assert_eq!(event.amount, 150);
+        assert_eq!(event.original_ts, 100);
+        assert_eq!(event.reason_code, 10);
+        assert_eq!(event.new_utilized_amount, 250);
+        assert_eq!(event.timestamp, 200);
+        assert!(event.accounting_only);
+    }
+
+    #[test]
+    #[should_panic(expected = "draw reversal window expired")]
+    fn reverse_draw_outside_window_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, _token, _contract_id) = setup(&env, &borrower, 1_000, 1_000);
+
+        env.ledger().set_timestamp(100);
+        client.draw_credit(&borrower, &300);
+
+        env.ledger().set_timestamp(100 + DRAW_REVERSAL_WINDOW_SECS + 1);
+        client.reverse_draw(&borrower, &100, &100_u64, &20_u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "original draw not found for borrower")]
+    fn reverse_draw_wrong_borrower_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower_a = Address::generate(&env);
+        let borrower_b = Address::generate(&env);
+
+        let (client, _token, _contract_id) = setup(&env, &borrower_a, 1_000, 1_000);
+        client.open_credit_line(&borrower_b, &1_000, &300_u32, &70_u32);
+
+        env.ledger().set_timestamp(500);
+        client.draw_credit(&borrower_a, &250);
+
+        env.ledger().set_timestamp(600);
+        client.reverse_draw(&borrower_b, &100, &500_u64, &30_u32);
+    }
+
+    #[test]
+    fn reverse_draw_is_accounting_only_and_preserves_token_balances() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, token, contract_id) = setup(&env, &borrower, 1_000, 1_000);
+
+        let token_client = TokenClient::new(&env, &token);
+
+        env.ledger().set_timestamp(700);
+        client.draw_credit(&borrower, &400);
+        let borrower_balance_after_draw = token_client.balance(&borrower);
+        let reserve_balance_after_draw = token_client.balance(&contract_id);
+        assert_eq!(borrower_balance_after_draw, 400);
+        assert_eq!(reserve_balance_after_draw, 600);
+
+        env.ledger().set_timestamp(900);
+        client.reverse_draw(&borrower, &125, &700_u64, &40_u32);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.utilized_amount, 275);
+
+        // Reversal is accounting-only: no token balances are moved back.
+        assert_eq!(token_client.balance(&borrower), borrower_balance_after_draw);
+        assert_eq!(token_client.balance(&contract_id), reserve_balance_after_draw);
+    }
+}
