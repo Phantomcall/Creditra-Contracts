@@ -142,6 +142,16 @@ Draw funds from an **Active** credit line. Caller must be the borrower.
 
 Emits: `("credit", "drawn")` event.
 
+### `reverse_draw(env, borrower, amount, original_ts, reason_code)`
+Admin-only bounded reversal for erroneous draws.
+
+- Reversal is allowed only when `ledger_timestamp - original_ts <= 3600` seconds.
+- Reversal is validated against borrower-scoped draw audit data keyed by `(borrower, original_ts)`.
+- Supports partial reversal; total reversed amount cannot exceed the original drawn amount at that timestamp.
+- **Accounting-only behavior**: this call updates debt accounting (`utilized_amount`) and emits an audit event, but does not move tokens from borrower back to reserve.
+
+Emits: `("credit", "draw_rev")` event with `DrawReversedEvent` payload containing borrower, amount, original draw timestamp, reason code, actor, and post-reversal utilization.
+
 ### `repay_credit(env, borrower, amount)`
 Repay outstanding drawn funds.
 
@@ -360,6 +370,7 @@ The `Credit` contract uses standard `u32` discriminants for standardized error h
 |----------------------------|------------|-----------------------------|-----------|
 | `("credit", "opened")`     | `opened`   | `open_credit_line`          | New credit line created |
 | `("credit", "drawn")`      | `drawn`    | `draw_credit`               | Funds drawn |
+| `("credit", "draw_rev")`   | `draw_rev` | `reverse_draw`              | Admin accounting reversal for erroneous draw (audit trail with reason code) |
 | `("credit", "repay")`      | `repay`    | `repay_credit`              | Repayment made (includes interest/principal allocation) |
 | `("credit", "accrue")`     | `accrue`   | `apply_pending_accrual`     | Interest capitalized into debt |
 | `("credit", "suspend")`    | `suspend`  | `suspend_credit_line`       | Line suspended |
@@ -381,6 +392,7 @@ like actor/source/timestamp identifiers) while keeping v1 payloads stable. See
 | `init`                   | Deployer (once)       |
 | `open_credit_line`       | Backend / risk engine |
 | `draw_credit`            | Borrower              |
+| `reverse_draw`           | Admin                 |
 | `repay_credit`           | Borrower              |
 | `update_risk_parameters` | Admin / risk engine   |
 | `suspend_credit_line`    | Admin                 |

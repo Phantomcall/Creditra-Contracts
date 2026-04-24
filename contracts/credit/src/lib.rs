@@ -24,13 +24,13 @@ mod accrual;
 mod accrual_tests;
 
 use soroban_sdk::{
-    contract, contractimpl, symbol_short, token, Address, Env, Symbol,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
 };
 
 use crate::events::{
     publish_credit_line_event, publish_drawn_event, publish_interest_accrued_event,
-    publish_repayment_event, CreditLineEvent, DrawnEvent, InterestAccruedEvent,
-    RepaymentEvent,
+    publish_repayment_event, publish_draw_reversed_event, CreditLineEvent, DrawnEvent,
+    DrawReversedEvent, InterestAccruedEvent, RepaymentEvent,
 };
 use types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
 use auth::require_admin_auth;
@@ -40,6 +40,21 @@ use storage::{clear_reentrancy_guard, set_reentrancy_guard, rate_cfg_key, DataKe
 
 /// Seconds in a standard year (365 days).
 const SECONDS_PER_YEAR: u64 = 31_536_000;
+
+/// Admin draw reversal window in seconds (1 hour).
+const DRAW_REVERSAL_WINDOW_SECS: u64 = 3_600;
+
+/// Per-borrower draw audit record used to validate bounded reversals.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DrawAuditRecord {
+    draw_amount: i128,
+    reversed_amount: i128,
+}
+
+fn draw_audit_key(borrower: &Address, original_ts: u64) -> (Symbol, Address, u64) {
+    (symbol_short!("draw_aud"), borrower.clone(), original_ts)
+}
 
 /// Instance storage key for reentrancy guard.
 fn reentrancy_key(env: &Env) -> Symbol {
@@ -322,6 +337,25 @@ impl Credit {
         credit_line.utilized_amount = updated_utilized;
         env.storage().persistent().set(&borrower, &credit_line);
         let timestamp = env.ledger().timestamp();
+
+        let audit_key = draw_audit_key(&borrower, timestamp);
+        let mut draw_audit: DrawAuditRecord = env
+            .storage()
+            .persistent()
+            .get(&audit_key)
+            .unwrap_or(DrawAuditRecord {
+                draw_amount: 0,
+                reversed_amount: 0,
+            });
+        draw_audit.draw_amount = draw_audit
+            .draw_amount
+            .checked_add(amount)
+            .unwrap_or_else(|| {
+                clear_reentrancy_guard(&env);
+                env.panic_with_error(ContractError::Overflow)
+            });
+        env.storage().persistent().set(&audit_key, &draw_audit);
+
         publish_interest_accrued_event(
             &env,
             InterestAccruedEvent {
@@ -343,6 +377,87 @@ impl Credit {
         );
         clear_reentrancy_guard(&env);
         ()
+    }
+
+    /// Reverse an erroneous draw within a bounded admin-only window.
+    ///
+    /// This is accounting-only: no token transfer/clawback is attempted.
+    pub fn reverse_draw(
+        env: Env,
+        borrower: Address,
+        amount: i128,
+        original_ts: u64,
+        reason_code: u32,
+    ) {
+        let admin = require_admin_auth(&env);
+
+        if amount <= 0 {
+            env.panic_with_error(ContractError::InvalidAmount);
+        }
+
+        if reason_code == 0 {
+            panic!("reason_code must be non-zero");
+        }
+
+        let now = env.ledger().timestamp();
+        if original_ts > now {
+            panic!("original_ts cannot be in the future");
+        }
+
+        if now.saturating_sub(original_ts) > DRAW_REVERSAL_WINDOW_SECS {
+            panic!("draw reversal window expired");
+        }
+
+        let audit_key = draw_audit_key(&borrower, original_ts);
+        let mut draw_audit: DrawAuditRecord = env
+            .storage()
+            .persistent()
+            .get(&audit_key)
+            .unwrap_or_else(|| panic!("original draw not found for borrower"));
+
+        let remaining_reversible = draw_audit
+            .draw_amount
+            .saturating_sub(draw_audit.reversed_amount);
+        if amount > remaining_reversible {
+            panic!("reversal amount exceeds reversible draw amount");
+        }
+
+        let mut credit_line: CreditLineData = env
+            .storage()
+            .persistent()
+            .get(&borrower)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::CreditLineNotFound));
+
+        if credit_line.status == CreditStatus::Closed {
+            env.panic_with_error(ContractError::CreditLineClosed);
+        }
+
+        if amount > credit_line.utilized_amount {
+            panic!("reversal amount exceeds utilized amount");
+        }
+
+        credit_line.utilized_amount = credit_line.utilized_amount.saturating_sub(amount);
+        if credit_line.accrued_interest > credit_line.utilized_amount {
+            credit_line.accrued_interest = credit_line.utilized_amount;
+        }
+        env.storage().persistent().set(&borrower, &credit_line);
+
+        draw_audit.reversed_amount = draw_audit.reversed_amount.saturating_add(amount);
+        env.storage().persistent().set(&audit_key, &draw_audit);
+
+        publish_draw_reversed_event(
+            &env,
+            DrawReversedEvent {
+                borrower,
+                amount,
+                original_ts,
+                reason_code,
+                new_utilized_amount: credit_line.utilized_amount,
+                timestamp: now,
+                admin,
+                accounting_only: true,
+            },
+        );
     }
 
     /// Repay credit (borrower).
@@ -2883,5 +2998,133 @@ mod test_max_draw_amount {
         client.draw_credit(&borrower, &200_i128);
         let line = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.utilized_amount, 500);
+    }
+}
+
+#[cfg(test)]
+mod test_draw_reversal_window {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::testutils::Ledger;
+    use soroban_sdk::token::Client as TokenClient;
+    use soroban_sdk::token::StellarAssetClient;
+    use soroban_sdk::{symbol_short, TryFromVal, TryIntoVal};
+
+    fn setup<'a>(
+        env: &'a Env,
+        borrower: &Address,
+        credit_limit: i128,
+        reserve: i128,
+    ) -> (CreditClient<'a>, Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(env, &contract_id);
+        client.init(&admin);
+
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(env));
+        let token_address = token_id.address();
+        client.set_liquidity_token(&token_address);
+        client.set_liquidity_source(&contract_id);
+        if reserve > 0 {
+            StellarAssetClient::new(env, &token_address).mint(&contract_id, &reserve);
+        }
+
+        client.open_credit_line(borrower, &credit_limit, &300_u32, &70_u32);
+        (client, token_address, contract_id)
+    }
+
+    #[test]
+    fn reverse_draw_within_window_succeeds_and_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, _token, _contract_id) = setup(&env, &borrower, 1_000, 1_000);
+
+        env.ledger().set_timestamp(100);
+        client.draw_credit(&borrower, &400);
+
+        env.ledger().set_timestamp(200);
+        client.reverse_draw(&borrower, &150, &100_u64, &10_u32);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.utilized_amount, 250);
+
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+        let topic0 = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        let topic1 = Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+        assert_eq!(topic0, symbol_short!("credit"));
+        assert_eq!(topic1, symbol_short!("draw_rev"));
+
+        let event: DrawReversedEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event.borrower, borrower);
+        assert_eq!(event.amount, 150);
+        assert_eq!(event.original_ts, 100);
+        assert_eq!(event.reason_code, 10);
+        assert_eq!(event.new_utilized_amount, 250);
+        assert_eq!(event.timestamp, 200);
+        assert!(event.accounting_only);
+    }
+
+    #[test]
+    #[should_panic(expected = "draw reversal window expired")]
+    fn reverse_draw_outside_window_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, _token, _contract_id) = setup(&env, &borrower, 1_000, 1_000);
+
+        env.ledger().set_timestamp(100);
+        client.draw_credit(&borrower, &300);
+
+        env.ledger().set_timestamp(100 + DRAW_REVERSAL_WINDOW_SECS + 1);
+        client.reverse_draw(&borrower, &100, &100_u64, &20_u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "original draw not found for borrower")]
+    fn reverse_draw_wrong_borrower_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower_a = Address::generate(&env);
+        let borrower_b = Address::generate(&env);
+
+        let (client, _token, _contract_id) = setup(&env, &borrower_a, 1_000, 1_000);
+        client.open_credit_line(&borrower_b, &1_000, &300_u32, &70_u32);
+
+        env.ledger().set_timestamp(500);
+        client.draw_credit(&borrower_a, &250);
+
+        env.ledger().set_timestamp(600);
+        client.reverse_draw(&borrower_b, &100, &500_u64, &30_u32);
+    }
+
+    #[test]
+    fn reverse_draw_is_accounting_only_and_preserves_token_balances() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, token, contract_id) = setup(&env, &borrower, 1_000, 1_000);
+
+        let token_client = TokenClient::new(&env, &token);
+
+        env.ledger().set_timestamp(700);
+        client.draw_credit(&borrower, &400);
+        let borrower_balance_after_draw = token_client.balance(&borrower);
+        let reserve_balance_after_draw = token_client.balance(&contract_id);
+        assert_eq!(borrower_balance_after_draw, 400);
+        assert_eq!(reserve_balance_after_draw, 600);
+
+        env.ledger().set_timestamp(900);
+        client.reverse_draw(&borrower, &125, &700_u64, &40_u32);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.utilized_amount, 275);
+
+        // Reversal is accounting-only: no token balances are moved back.
+        assert_eq!(token_client.balance(&borrower), borrower_balance_after_draw);
+        assert_eq!(token_client.balance(&contract_id), reserve_balance_after_draw);
     }
 }
