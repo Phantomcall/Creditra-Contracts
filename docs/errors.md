@@ -42,12 +42,19 @@ Rules enforced by CI (`tests/error_discriminants.rs`):
 | `12` | `Overflow`                       | An arithmetic operation (e.g., `checked_add` on `utilized_amount`) would overflow `i128`. | Amounts near `i128::MAX` are not supported. Reduce the draw or limit value. |
 | `13` | `LimitDecreaseRequiresRepayment` | A limit decrease was requested that would push `credit_limit` below `utilized_amount`. The line transitions to `Restricted` status. | Borrower must repay the excess (`utilized_amount - new_limit`) before the limit can be lowered further. |
 | `14` | `AlreadyInitialized`             | `init` was called on a contract that already has an admin stored. | `init` is a one-time operation. Do not call it again after deployment. |
-| `15` | `DrawsFrozen`                    | All draws are globally frozen by admin for liquidity reserve operations. | Wait for the admin to unfreeze draws via `unfreeze_draws`. |
-| `16` | `DrawExceedsMaxAmount`           | The requested draw amount exceeds the per-transaction cap set via `set_max_draw_amount`. | Split the draw into smaller transactions or request a cap increase from the admin. |
-| `17` | `BorrowerBlocked`                | The borrower address is on the admin-managed block list; draws are disabled. | Contact the protocol admin to remove the block, or use a different borrower address. |
-| `18` | `AdminAcceptTooEarly`            | `accept_admin` was called before the `delay_seconds` window set in `propose_admin` has elapsed. | Wait until `env.ledger().timestamp() >= accept_after` and retry. |
-| `19` | `Paused`                         | The protocol is paused via the emergency circuit breaker; operation is blocked. | Wait for the admin to unpause the protocol via `set_protocol_paused(false)`. `repay_credit` remains active during a pause. |
-| `20` | `DrawCooldownActive`             | The borrower attempted to draw again before the configured cooldown interval elapsed. | Wait the configured interval and retry, or ask admin to disable the cooldown by setting `0`. |
+| `15` | `AdminAcceptTooEarly`            | `accept_admin` was called before the `delay_seconds` window set in `propose_admin` has elapsed. | Wait until `env.ledger().timestamp() >= accept_after` and retry. |
+| `16` | `BorrowerBlocked`                | The borrower address is on the admin-managed block list; draws are disabled. | Contact the protocol admin to remove the block, or use a different borrower address. |
+| `17` | `DrawExceedsMaxAmount`           | The requested draw amount exceeds the per-transaction cap set via `set_max_draw_amount`. | Split the draw into smaller transactions or request a cap increase from the admin. |
+| `18` | `Paused`                         | The protocol is paused via the emergency circuit breaker; operation is blocked. | Wait for the admin to unpause the protocol via `set_protocol_paused(false)`. `repay_credit` remains active during a pause. |
+| `19` | `DrawsFrozen`                    | Draws are globally frozen during liquidity reserve operations. | Wait for the admin to call `unfreeze_draws`. Repayments remain available. |
+| `20` | `CreditLineSuspended`            | A draw was attempted while the credit line status is `Suspended`. | Reinstate the line or resolve the suspension before drawing. |
+| `21` | `CreditLineDefaulted`            | A draw was attempted while the credit line status is `Defaulted`. | Defaulted lines cannot draw; use repayment or liquidation workflows. |
+| `22` | `MissingLiquidityToken`          | `draw_credit` or `repay_credit` requires a liquidity token, but none is configured. | Admin must call `set_liquidity_token` before liquidity-moving operations. |
+| `23` | `MissingLiquiditySource`         | `draw_credit` or `repay_credit` requires a liquidity source, but none is configured. | Admin must call `set_liquidity_source` or run the configured initialization path. |
+| `24` | `InsufficientLiquidityReserve`   | The reserve token balance is below the requested draw amount. | Fund the liquidity source or reduce the draw amount. |
+| `25` | `LiquidityTokenCallFailed`       | A liquidity token interaction failed where the contract can expose a canonical token-call failure. | Inspect the configured token contract and retry only after the token issue is resolved. |
+| `26` | `InsufficientRepaymentAllowance` | The borrower has not approved enough liquidity token allowance for `repay_credit`. | Approve at least the effective repayment amount for the credit contract. |
+| `27` | `InsufficientRepaymentBalance`   | The borrower's liquidity token balance is below the effective repayment amount. | Transfer or mint enough tokens to the borrower before retrying repayment. |
 
 ---
 
@@ -127,6 +134,14 @@ remains active to allow users to reduce their debt exposure even during an incid
 The pause state is stored in instance storage and checked at the entry of every
 guarded function. Read-only operations (`get_credit_line`, `is_protocol_paused`, etc.)
 are never blocked.
+
+**Liquidity errors (codes 22-27)**
+Liquidity-moving operations use stable `ContractError` codes instead of ad-hoc
+panic strings. `draw_credit` requires both `LiquidityToken` and `LiquiditySource`,
+then checks the source balance before transferring. `repay_credit` requires the
+same configuration and checks allowance and borrower balance before `transfer_from`.
+Soroban token calls that trap internally are not catchable by this contract; the
+canonical token-call variants cover failures observable before state mutation.
 
 ### General Trust Model
 

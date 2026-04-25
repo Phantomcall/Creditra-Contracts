@@ -40,7 +40,7 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
 
 /// Contract API version (major, minor, patch).
 /// Increment major on breaking ABI/storage changes, minor on additive features, patch on fixes.
-pub const CONTRACT_API_VERSION: (u32, u32, u32) = (1, 0, 0);
+pub const CONTRACT_API_VERSION: (u32, u32, u32) = (1, 1, 0);
 
 /// Seconds in a standard year (365 days).
 #[allow(dead_code)]
@@ -113,13 +113,29 @@ impl Credit {
         );
     }
 
-    /// @notice Sets the token contract used for reserve/liquidity checks and draw transfers.
+    /// Sets the token contract used for reserve/liquidity checks and draw transfers.
     pub fn set_liquidity_token(env: Env, token_address: Address) {
-        config::set_liquidity_token(env, token_address)
+        require_admin_auth(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::LiquidityToken, &token_address);
     }
 
     pub fn set_liquidity_source(env: Env, reserve_address: Address) {
-        config::set_liquidity_source(env, reserve_address)
+        require_admin_auth(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::LiquiditySource, &reserve_address);
+    }
+
+    /// Return the current liquidity source address (view function).
+    ///
+    /// Defaults to the contract's own address until overridden by `set_liquidity_source`.
+    pub fn get_liquidity_source(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::LiquiditySource)
+            .unwrap_or_else(|| env.current_contract_address())
     }
 
     /// Open a new credit line for a borrower.
@@ -192,13 +208,6 @@ impl Credit {
             }
         }
 
-        let token_address: Option<Address> = env.storage().instance().get(&DataKey::LiquidityToken);
-        let reserve_address: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::LiquiditySource)
-            .unwrap_or(env.current_contract_address());
-
         let mut credit_line: CreditLineData = env
             .storage()
             .persistent()
@@ -269,15 +278,30 @@ impl Credit {
             env.panic_with_error(ContractError::OverLimit);
         }
 
-        if let Some(token_address) = token_address {
-            let token_client = token::Client::new(&env, &token_address);
-            let reserve_balance = token_client.balance(&reserve_address);
-            if reserve_balance < amount {
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::LiquidityToken)
+            .unwrap_or_else(|| {
                 clear_reentrancy_guard(&env);
-                panic!("Insufficient liquidity reserve for requested draw amount");
-            }
-            token_client.transfer(&reserve_address, &borrower, &amount);
+                env.panic_with_error(ContractError::MissingLiquidityToken)
+            });
+        let reserve_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::LiquiditySource)
+            .unwrap_or_else(|| {
+                clear_reentrancy_guard(&env);
+                env.panic_with_error(ContractError::MissingLiquiditySource)
+            });
+
+        let token_client = token::Client::new(&env, &token_address);
+        let reserve_balance = token_client.balance(&reserve_address);
+        if reserve_balance < amount {
+            clear_reentrancy_guard(&env);
+            env.panic_with_error(ContractError::InsufficientLiquidityReserve);
         }
+        token_client.transfer(&reserve_address, &borrower, &amount);
 
         credit_line.utilized_amount = updated_utilized;
         env.storage().persistent().set(&borrower, &credit_line);
@@ -301,17 +325,13 @@ impl Credit {
     pub fn repay_credit(env: Env, borrower: Address, amount: i128) {
         // --- Reentrancy guard (defense-in-depth) ---
         set_reentrancy_guard(&env);
-
-        // --- Auth: only the borrower may repay their own line ---
         borrower.require_auth();
 
-        // --- Input validation ---
         if amount <= 0 {
             clear_reentrancy_guard(&env);
             env.panic_with_error(ContractError::InvalidAmount);
         }
 
-        // --- Load credit line ---
         let mut credit_line: CreditLineData = env
             .storage()
             .persistent()
@@ -337,45 +357,48 @@ impl Credit {
             amount
         };
 
-        // --- Token transfer (when liquidity token is configured) ---
-        // We check allowance and balance *before* mutating state so that a
-        // failed transfer reverts cleanly without partial state changes.
         if effective_repay > 0 {
-            let token_address: Option<Address> =
-                env.storage().instance().get(&DataKey::LiquidityToken);
-
-            if let Some(token_address) = token_address {
-                let reserve_address: Address = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::LiquiditySource)
-                    .unwrap_or_else(|| env.current_contract_address());
-
-                let token_client = token::Client::new(&env, &token_address);
-                let contract_address = env.current_contract_address();
-
-                // Guard: allowance must cover the effective repayment.
-                let allowance = token_client.allowance(&borrower, &contract_address);
-                if allowance < effective_repay {
+            let token_address: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::LiquidityToken)
+                .unwrap_or_else(|| {
                     clear_reentrancy_guard(&env);
-                    panic!("Insufficient allowance");
-                }
-
-                // Guard: borrower must actually hold the tokens.
-                let balance = token_client.balance(&borrower);
-                if balance < effective_repay {
+                    env.panic_with_error(ContractError::MissingLiquidityToken)
+                });
+            let reserve_address: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::LiquiditySource)
+                .unwrap_or_else(|| {
                     clear_reentrancy_guard(&env);
-                    panic!("Insufficient balance");
-                }
+                    env.panic_with_error(ContractError::MissingLiquiditySource)
+                });
 
-                // Pull tokens from borrower → liquidity source via transfer_from.
-                token_client.transfer_from(
-                    &contract_address,
-                    &borrower,
-                    &reserve_address,
-                    &effective_repay,
-                );
+            let token_client = token::Client::new(&env, &token_address);
+            let contract_address = env.current_contract_address();
+
+            // Guard: allowance must cover the effective repayment.
+            let allowance = token_client.allowance(&borrower, &contract_address);
+            if allowance < effective_repay {
+                clear_reentrancy_guard(&env);
+                env.panic_with_error(ContractError::InsufficientRepaymentAllowance);
             }
+
+            // Guard: borrower must actually hold the tokens.
+            let balance = token_client.balance(&borrower);
+            if balance < effective_repay {
+                clear_reentrancy_guard(&env);
+                env.panic_with_error(ContractError::InsufficientRepaymentBalance);
+            }
+
+            // Pull tokens from borrower to liquidity source via transfer_from.
+            token_client.transfer_from(
+                &contract_address,
+                &borrower,
+                &reserve_address,
+                &effective_repay,
+            );
         }
 
         // --- Update state with "interest-first" policy ---
@@ -396,7 +419,6 @@ impl Credit {
 
         env.storage().persistent().set(&borrower, &credit_line);
 
-        // --- Emit event ---
         let timestamp = env.ledger().timestamp();
         publish_interest_accrued_event(
             &env,
@@ -421,7 +443,6 @@ impl Credit {
             },
         );
 
-        // --- Release reentrancy guard ---
         clear_reentrancy_guard(&env);
     }
 
@@ -455,7 +476,7 @@ impl Credit {
     ///
     /// Returns `None` if no limits have been configured yet.
     pub fn get_rate_change_limits(env: Env) -> Option<RateChangeConfig> {
-        risk::get_rate_change_limits(env)
+        env.storage().instance().get(&rate_cfg_key(&env))
     }
 
     // ── Grace period policy ───────────────────────────────────────────────────
@@ -551,6 +572,11 @@ impl Credit {
         lifecycle::suspend_credit_line(env, borrower)
     }
 
+    /// Allow a borrower to suspend their own active line as a safety control.
+    pub fn self_suspend_credit_line(env: Env, borrower: Address) {
+        lifecycle::self_suspend_credit_line(env, borrower)
+    }
+
     /// Permanently close a credit line.
     /// Admin can close any line. Borrower can only close if utilization is zero.
     pub fn close_credit_line(env: Env, borrower: Address, closer: Address) {
@@ -562,8 +588,33 @@ impl Credit {
         lifecycle::default_credit_line(env, borrower)
     }
 
-    pub fn reinstate_credit_line(env: Env, borrower: Address) {
-        lifecycle::reinstate_credit_line(env, borrower)
+    /// Reinstate a `Defaulted` credit line to `Active` or `Suspended` (admin only).
+    ///
+    /// # State transition
+    /// `Defaulted → Active`   (when `target_status == CreditStatus::Active`)
+    /// `Defaulted → Suspended` (when `target_status == CreditStatus::Suspended`)
+    ///
+    /// This is the only valid exit from `Defaulted` other than a force-close.
+    ///
+    /// # Post-reinstatement invariants
+    /// - `utilized_amount` is preserved; it continues to satisfy
+    ///   `0 ≤ utilized_amount ≤ credit_limit`.
+    /// - `interest_rate_bps`, `risk_score`, and `credit_limit` are unchanged.
+    /// - If reinstated to `Active`, draws are immediately permitted.
+    /// - If reinstated to `Suspended`, draws remain blocked.
+    /// - A `"reinstate"` event is emitted.
+    ///
+    /// # Parameters
+    /// - `borrower` — The borrower whose line is being reinstated.
+    /// - `target_status` — Must be [`CreditStatus::Active`] or [`CreditStatus::Suspended`].
+    ///
+    /// # Errors
+    /// - [`ContractError::NotAdmin`] — caller is not the contract admin.
+    /// - Panics `"credit line is not defaulted"` if not in `Defaulted` state.
+    /// - Panics `"invalid target status: must be Active or Suspended"` for invalid targets.
+    /// - Panics `"Credit line not found"` if borrower has no credit line.
+    pub fn reinstate_credit_line(env: Env, borrower: Address, target_status: CreditStatus) {
+        lifecycle::reinstate_credit_line(env, borrower, target_status)
     }
 
     // duplicate wrapper removed
@@ -664,6 +715,9 @@ mod test_rate_change_limits {
         env.mock_all_auths();
         let admin = Address::generate(env);
         let contract_id = env.register(Credit, ());
+        let token_admin = Address::generate(env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin);
+        let token_address = token_id.address();
         let client = CreditClient::new(env, &contract_id);
         client.init(&admin);
         let token_id = env.register_stellar_asset_contract_v2(Address::generate(env));
@@ -931,11 +985,11 @@ mod test_coverage {
     }
 
     #[test]
-    fn borrow_draw_without_token_updates_state() {
+    #[should_panic(expected = "Error(Contract, #22)")]
+    fn borrow_draw_without_token_reverts_with_contract_error() {
         let env = Env::default();
         let (client, _admin, borrower) = base(&env);
         client.draw_credit(&borrower, &200_i128);
-        assert_eq!(client.get_credit_line(&borrower).unwrap().utilized_amount, 200);
     }
 
     // State immutability on insufficient allowance is covered by the
@@ -1067,7 +1121,7 @@ mod test_coverage {
     }
 
     #[test]
-    #[should_panic(expected = "Insufficient liquidity reserve")]
+    #[should_panic(expected = "Error(Contract, #24)")]
     fn borrow_draw_insufficient_reserve_reverts() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1793,7 +1847,7 @@ mod test_mock_liquidity_token {
     #[test]
     fn draw_transfers_reserve_to_borrower() { let env = Env::default(); let (client, contract_id, borrower, liquidity) = setup(&env); liquidity.mint(&contract_id, 500); client.draw_credit(&borrower, &300_i128); assert_eq!(liquidity.balance(&borrower), 300); }
     #[test]
-    #[should_panic(expected = "Insufficient liquidity reserve")]
+    #[should_panic(expected = "Error(Contract, #24)")]
     fn draw_fails_reserve_empty() { let env = Env::default(); let (client, _c, borrower, _l) = setup(&env); client.draw_credit(&borrower, &100_i128); }
     #[should_panic(expected = "credit line is not defaulted")]
     fn reinstate_non_defaulted_active_line_reverts() {
@@ -1963,7 +2017,7 @@ mod test_mock_liquidity_token {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #18)")]
+    #[should_panic(expected = "Error(Contract, #20)")]
     fn test_draw_credit_on_suspended_line() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2011,7 +2065,7 @@ mod test_mock_liquidity_token {
     // ── draw_credit: defaulted line rejects draw ──────────────────────────────
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #19)")]
+    #[should_panic(expected = "Error(Contract, #21)")]
     fn draw_credit_on_defaulted_line_reverts() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2296,7 +2350,7 @@ mod test_mock_liquidity_token {
 
     /// draw_credit is blocked on a Defaulted credit line.
     #[test]
-    #[should_panic(expected = "Error(Contract, #19)")]
+    #[should_panic(expected = "Error(Contract, #21)")]
     fn test_draw_credit_blocked_on_defaulted_line() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2781,9 +2835,9 @@ mod test_draw_freeze {
         assert!(client.is_draws_frozen());
     }
 
-    /// draw_credit reverts with DrawsFrozen (error #15) when frozen.
+    /// draw_credit reverts with DrawsFrozen (error #19) when frozen.
     #[test]
-    #[should_panic(expected = "Error(Contract, #15)")]
+    #[should_panic(expected = "Error(Contract, #19)")]
     fn draw_credit_reverts_when_frozen() {
         let env = Env::default();
         let (client, _admin, borrower) = setup(&env);
@@ -3737,5 +3791,98 @@ mod test_draw_reversal_window {
         // Reversal is accounting-only: no token balances are moved back.
         assert_eq!(token_client.balance(&borrower), borrower_balance_after_draw);
         assert_eq!(token_client.balance(&contract_id), reserve_balance_after_draw);
+    }
+}
+
+#[cfg(test)]
+mod test_liquidity_error_codes {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+
+    fn setup<'a>(
+        env: &'a Env,
+        reserve: i128,
+    ) -> (CreditClient<'a>, Address, Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let borrower = Address::generate(env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(env, &contract_id);
+        client.init(&admin);
+
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(env));
+        let token_address = token_id.address();
+        client.set_liquidity_token(&token_address);
+        client.set_liquidity_source(&contract_id);
+        if reserve > 0 {
+            StellarAssetClient::new(env, &token_address).mint(&contract_id, &reserve);
+        }
+
+        client.open_credit_line(&borrower, &1_000, &300_u32, &70_u32);
+        (client, contract_id, borrower, token_address)
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #22)")]
+    fn draw_without_liquidity_token_uses_stable_error_code() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000, &300_u32, &70_u32);
+
+        client.draw_credit(&borrower, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #23)")]
+    fn draw_without_liquidity_source_uses_stable_error_code() {
+        let env = Env::default();
+        let (client, contract_id, borrower, _token) = setup(&env, 1_000);
+        env.as_contract(&contract_id, || {
+            env.storage().instance().remove(&DataKey::LiquiditySource);
+        });
+
+        client.draw_credit(&borrower, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #24)")]
+    fn draw_with_insufficient_reserve_uses_stable_error_code() {
+        let env = Env::default();
+        let (client, _contract_id, borrower, _token) = setup(&env, 50);
+
+        client.draw_credit(&borrower, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #26)")]
+    fn repay_with_insufficient_allowance_uses_stable_error_code() {
+        let env = Env::default();
+        let (client, _contract_id, borrower, token) = setup(&env, 1_000);
+        client.draw_credit(&borrower, &200);
+        StellarAssetClient::new(&env, &token).mint(&borrower, &200);
+
+        client.repay_credit(&borrower, &200);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #27)")]
+    fn repay_with_insufficient_balance_uses_stable_error_code() {
+        let env = Env::default();
+        let (client, contract_id, borrower, token) = setup(&env, 1_000);
+        client.draw_credit(&borrower, &200);
+        TokenClient::new(&env, &token).approve(&borrower, &contract_id, &200, &1_000_u32);
+        TokenClient::new(&env, &token).transfer(
+            &borrower,
+            &Address::generate(&env),
+            &200,
+        );
+
+        client.repay_credit(&borrower, &200);
     }
 }

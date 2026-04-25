@@ -39,7 +39,7 @@ Stored in instance storage under the `"rate_cfg"` key. Optional — when absent,
 | Variant    | Value | Description |
 |------------|-------|-----------|
 | `Active`   | 0     | Credit line is open and available |
-| `Suspended`| 1     | Credit line is temporarily suspended |
+| `Suspended`| 1     | Credit line is temporarily suspended; draws are blocked and repayments remain allowed |
 | `Defaulted`| 2     | Borrower has defaulted; draw disabled, repay allowed |
 | `Closed`   | 3     | Credit line has been permanently closed |
 | `Restricted` | 4   | Limit is below utilization; additional draws are blocked until cured |
@@ -49,14 +49,16 @@ Stored in instance storage under the `"rate_cfg"` key. Optional — when absent,
 | From       | To         | Trigger |
 |------------|------------|---------|
 | Active     | Suspended  | Admin calls `suspend_credit_line` |
+| Active     | Suspended  | Borrower calls `self_suspend_credit_line` |
 | Active     | Defaulted  | Admin calls `default_credit_line` |
 | Suspended  | Defaulted  | Admin calls `default_credit_line` |
+| Suspended  | Active     | Admin-approved `open_credit_line` reopen workflow |
 | Defaulted  | Active     | Admin calls `reinstate_credit_line` |
 | Defaulted  | Closed     | Admin or borrower (when `utilized_amount == 0`) calls `close_credit_line` |
 | Active     | Closed     | Admin or borrower (when `utilized_amount == 0`) calls `close_credit_line` |
 | Suspended  | Closed     | Admin or borrower (when `utilized_amount == 0`) calls `close_credit_line` |
 
-When status is **Defaulted**: `draw_credit` is disabled; `repay_credit` is still allowed.
+When status is **Suspended** or **Defaulted**: `draw_credit` is disabled; `repay_credit` is still allowed.
 
 ---
 
@@ -114,6 +116,9 @@ Sets the address that holds liquidity for draws and receives repayments (default
 
 ### `open_credit_line(env, borrower, credit_limit, interest_rate_bps, risk_score)`
 Opens a new credit line for a borrower. Called by the backend or risk engine.
+
+- Creating a brand-new line preserves the existing backend/risk-engine trust boundary.
+- Re-opening any existing non-`Active` line now requires admin auth so a borrower cannot self-suspend and then reactivate themselves on-chain.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -302,6 +307,17 @@ Suspend an Active credit line (admin only).
 
 Emits: `("credit", "suspend")` event.
 
+### `self_suspend_credit_line(env, borrower)`
+Allow a borrower to suspend their own Active credit line as a safety control.
+
+- Requires borrower auth.
+- Reverts if the line does not exist.
+- Reverts unless the current status is `Active`.
+- Blocks future draws but continues to allow `repay_credit`.
+- Does not give the borrower any reinstatement path; reactivation still requires an admin-controlled workflow.
+
+Emits: `("credit", "suspend")` event.
+
 ### Interest accrual
 
 Interest accrual fields exist in storage, but scheduled/lazy accrual logic is not yet active in the contract.
@@ -334,8 +350,11 @@ Apply auction liquidation proceeds to a defaulted line (admin only).
 
 Emits: `("credit", "liq_setl")` event. When fully settled, also emits `("credit", "closed")`.
 
-### `reinstate_credit_line(env, borrower, target_status)`
-Reinstate a Defaulted credit line to `target_status` (Active or Suspended). Admin only.
+### `reinstate_credit_line(env, borrower)`
+Reinstate a Defaulted credit line to Active. Admin only.
+
+- Requires `status == Defaulted`.
+- Self-suspended lines are not borrower-reinstatable. Any return to `Active` after borrower self-suspension must come from an admin-approved reopen workflow.
 
 Emits: `("credit", "reinstate")` event.
 
@@ -464,6 +483,7 @@ like actor/source/timestamp identifiers) while keeping v1 payloads stable. See
 | `repay_credit`           | Borrower              |
 | `update_risk_parameters` | Admin / risk engine   |
 | `suspend_credit_line`    | Admin                 |
+| `self_suspend_credit_line` | Borrower            |
 | `close_credit_line`      | Admin or borrower     |
 | `default_credit_line`    | Admin                 |
 | `settle_default_liquidation` | Admin             |
@@ -998,15 +1018,111 @@ cargo test -p creditra-credit
 
 ## Appendix: Storage Key Audit
 
+This appendix documents all storage keys used by the credit contract, their
+storage types (instance, persistent, or temporary), TTL implications, and
+security considerations.
+
+### Storage Type Definitions
+
+| Storage Type | TTL Behavior | Use Case |
+|--------------|--------------|----------|
+| **Instance** | Shared TTL across all instance keys. If the instance is archived, all instance keys are lost. | Global singleton configuration (admin, protocol settings) |
+| **Persistent** | Independent TTL per key. Each borrower's data can be archived separately. | Per-borrower credit line data |
+| **Temporary** | Lives only for the duration of a single invocation. | Short-lived state (not currently used) |
+
 ### Instance Storage
 
 Keys that share the contract instance TTL. If the instance is archived, all
 these keys are lost. Production deployments should call
-`env.storage().instance().extend_ttl()` periodically.
+`env.storage().instance().extend_ttl()` periodically to prevent archival.
 
-| Key | Rust type | Value type | Written by | Notes |
-|-----|-----------|------------|------------|-------|
-| `Symbol("admin")` | `Symbol` | `Address` | `init` | Contract admin. Written exactly once; second write reverts with `AlreadyInitialized`. |
+| Key | Rust type | Value type | Written by | TTL Notes |
+|-----|-----------|------------|------------|-----------|
+| `Symbol("admin")` | `Symbol` | `Address` | `init` | Written exactly once; second `init` reverts with `AlreadyInitialized`. Critical for access control — loss of instance storage means loss of admin. |
+| `Symbol("proposed_admin")` | `Symbol` | `Address` | `propose_admin` | Pending admin address during two-step rotation. Cleared on `accept_admin` or overwrite on new proposal. |
+| `Symbol("proposed_at")` | `Symbol` | `u64` | `propose_admin` | Ledger timestamp after which the proposed admin can accept. Cleared on `accept_admin`. |
+| `Symbol("reentrancy")` | `Symbol` | `bool` | `set_reentrancy_guard`, `clear_reentrancy_guard` | Defense-in-depth reentrancy guard. Set on entry to `draw_credit`/`repay_credit`, cleared on every exit path (success and failure). |
+| `Symbol("rate_cfg")` | `Symbol` | `RateChangeConfig` | `set_rate_change_limits` | Optional rate-change governance config. Absent = no limits enforced. |
+| `Symbol("rate_form")` | `Symbol` | `RateFormulaConfig` | Internal (risk module) | Optional piecewise-linear rate formula config. Absent = manual rate mode. |
+| `Symbol("paused")` | `Symbol` | `bool` | `set_paused` | Circuit breaker pause flag. Absent = `false` (not paused). Blocks all mutating operations except `repay_credit`. |
+| `Symbol("grace_period")` | `Symbol` | `GracePeriodConfig` | `set_grace_period_config` | Optional grace period policy for suspended lines. |
+| `DataKey::LiquidityToken` | `DataKey` | `Option<Address>` | `set_liquidity_token` | Token contract address for draw/repay transfers. Optional — contract works without a token configured. |
+| `DataKey::LiquiditySource` | `DataKey` | `Address` | `init`, `set_liquidity_source` | Reserve address holding liquidity. Defaults to contract address on `init`. |
+| `DataKey::MaxDrawAmount` | `DataKey` | `i128` | `set_max_draw_amount` | Optional per-transaction draw cap. Absent = no limit. |
+| `DataKey::DrawsFrozen` | `DataKey` | `bool` | `freeze_draws`, `unfreeze_draws` | Global emergency draw freeze. Absent = `false` (draws allowed). Does not affect repayments. |
+| `DataKey::SchemaVersion` | `DataKey` | `u32` | `init` | Storage schema version marker. Current version: `1`. Used for migration detection. |
+| `DataKey::BlockedBorrower(Address)` | `DataKey` | `bool` | `set_borrower_blocked` | Per-borrower block flag stored in **persistent** storage (note: uses `DataKey` enum but stored via `env.storage().persistent()`). |
+
+**TTL Management Recommendations:**
+- Call `env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO)` in frequently-called functions like `draw_credit`, `repay_credit`, or a dedicated `bump_instance_ttl()` admin function.
+- Recommended thresholds: check/extend when TTL drops below 100 ledgers, extend to 10,000 ledgers.
+
+### Persistent Storage
+
+Per-borrower records with independent TTL per entry. These keys survive instance archival and have their own TTL lifecycle.
+
+| Key | Rust type | Value type | Written by | TTL Notes |
+|-----|-----------|------------|------------|-----------|
+| `borrower: Address` | `Address` | `CreditLineData` | `open_credit_line`, `draw_credit`, `repay_credit`, `update_risk_parameters`, lifecycle transitions | Long-lived borrower credit line data. TTL should be extended on each access to prevent archival of active lines. |
+| `DataKey::BlockedBorrower(Address)` | `DataKey` | `bool` | `set_borrower_blocked` | Per-borrower blocking flag. Independent TTL from credit line data. |
+| `(Symbol("liq_seen"), borrower: Address, settlement_id: Symbol)` | Tuple | `bool` | `settle_default_liquidation` | One-time settlement marker to prevent replay of liquidation settlements. |
+
+**Why Persistent?** Each borrower's credit line must survive beyond a single transaction and has an independent lifecycle. Persistent storage is correct because:
+1. Borrower data outlives any single invocation
+2. Each borrower's TTL is independent (one borrower's archival doesn't affect others)
+3. Per-entity storage scales better than instance storage for large numbers of borrowers
+
+**TTL Management Recommendations:**
+- Extend TTL on credit line access: `env.storage().persistent().extend_ttl(&borrower, TTL_THRESHOLD, TTL_EXTEND_TO)`
+- Consider a keeper service that periodically extends TTLs for active credit lines
+
+### Temporary Storage
+
+Not currently used in the contract. The reentrancy guard is stored in instance storage but is always cleared before the function returns, making it functionally equivalent to temporary storage.
+
+**Future Consideration:** The reentrancy guard (`Symbol("reentrancy")`) could theoretically be moved to temporary storage (`env.storage().temporary()`) since it only needs to survive within a single invocation. However, Soroban's temporary storage has different cost characteristics and the current instance storage approach works correctly because the guard is always cleared.
+
+### Audit Findings Summary
+
+| Component | Storage Type | Correct? | Notes |
+|-----------|--------------|----------|-------|
+| Admin address | Instance | ✅ Yes | Single global value, correct for singleton pattern |
+| Proposed admin / proposed_at | Instance | ✅ Yes | Temporary during rotation, shares instance TTL |
+| LiquidityToken | Instance | ✅ Yes | Global configuration, one per contract |
+| LiquiditySource | Instance | ✅ Yes | Global configuration, one per contract |
+| Reentrancy flag | Instance | ✅ Yes* | *Cleared every call; could use temporary storage but instance works |
+| Rate config (rate_cfg) | Instance | ✅ Yes | Global governance parameter |
+| Rate formula config | Instance | ✅ Yes | Global formula configuration |
+| Pause flag | Instance | ✅ Yes | Global circuit breaker |
+| MaxDrawAmount | Instance | ✅ Yes | Global per-transaction limit |
+| DrawsFrozen | Instance | ✅ Yes | Global emergency flag |
+| SchemaVersion | Instance | ✅ Yes | Global schema marker |
+| Borrower credit lines | Persistent | ✅ Yes | Per-entity data with independent lifecycle |
+| BlockedBorrower | Persistent | ✅ Yes | Per-borrower flag, independent of credit line data |
+| Liquidation settlement markers | Persistent | ✅ Yes | Per-(borrower, settlement_id) replay protection |
+
+### Security Notes
+
+1. **No borrower data on instance storage** — Verified. Per-borrower data correctly uses persistent storage, avoiding the shared TTL pitfall where one borrower's activity could affect another's data availability.
+
+2. **Instance TTL is critical** — All global configuration shares one TTL. If the instance is archived, the contract loses admin, liquidity config, and all protocol settings. Production deployments must implement TTL extension.
+
+3. **Reentrancy guard semantics** — While stored in instance storage, the guard is functionally temporary (set on entry, cleared on all exits). This is safe but relies on correct implementation at all exit paths.
+
+4. **BlockedBorrower uses DataKey enum but persistent storage** — The `DataKey::BlockedBorrower(Address)` variant is stored via `env.storage().persistent()`, not instance storage. This is correct as it's per-borrower data.
+
+5. **Trust boundaries** — Instance storage contains all admin-controlled configuration. Compromise of the admin key allows modification of all instance-stored values. Persistent storage contains borrower-specific data that is protected by different authorization rules (borrower auth for draws/repays, admin auth for lifecycle changes).
+
+6. **Failure modes** — If instance TTL expires:
+   - Admin cannot be retrieved → all admin operations fail
+   - Liquidity config is lost → draws/repays may fail
+   - Reentrancy guard defaults to `false` → no reentrancy protection
+   - All protocol flags reset to defaults
+
+   If persistent TTL expires for a borrower:
+   - That borrower's credit line data is lost
+   - Other borrowers are unaffected
+   - The borrower would need to re-establish their credit line
 | `DataKey::LiquidityToken` | `DataKey` | `Address` | `set_liquidity_token` | Token contract for reserve/draw transfers. |
 | `DataKey::LiquiditySource` | `DataKey` | `Address` | `init`, `set_liquidity_source` | Reserve address. Defaults to contract address. |
 | `DataKey::DrawMinIntervalSeconds` | `DataKey` | `u64` | `set_draw_min_interval` | Minimum per-borrower draw interval in seconds. Absent = disabled. |
