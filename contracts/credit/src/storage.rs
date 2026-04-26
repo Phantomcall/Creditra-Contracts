@@ -15,6 +15,9 @@ pub enum DataKey {
     MaxDrawAmount,
     /// Per-borrower block flag; when `true`, draw_credit is rejected.
     BlockedBorrower(Address),
+    /// Per-borrower max utilization ratio cap in basis points (e.g. 8000 = 80%).
+    /// When set, draw_credit enforces: utilized_amount <= credit_limit * cap_bps / 10_000.
+    UtilizationCapBps(Address),
 }
 
 pub fn admin_key(env: &Env) -> Symbol {

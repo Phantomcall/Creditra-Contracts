@@ -305,6 +305,26 @@ impl Credit {
             env.panic_with_error(ContractError::OverLimit);
         }
 
+        // Enforce per-borrower utilization cap if configured.
+        if let Some(cap_bps) = env
+            .storage()
+            .instance()
+            .get::<_, u32>(&DataKey::UtilizationCapBps(borrower.clone()))
+        {
+            let cap_amount = credit_line
+                .credit_limit
+                .checked_mul(cap_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap_or_else(|| {
+                    clear_reentrancy_guard(&env);
+                    env.panic_with_error(ContractError::Overflow)
+                });
+            if updated_utilized > cap_amount {
+                clear_reentrancy_guard(&env);
+                panic!("exceeds utilization cap");
+            }
+        }
+
         let token_address: Address = env
             .storage()
             .instance()
@@ -502,6 +522,35 @@ impl Credit {
     /// Returns `None` if no limits have been configured yet.
     pub fn get_rate_change_limits(env: Env) -> Option<RateChangeConfig> {
         env.storage().instance().get(&rate_cfg_key(&env))
+    }
+
+    /// Set a per-borrower utilization cap in basis points (admin only).
+    ///
+    /// When set, `draw_credit` will reject any draw that would push
+    /// `utilized_amount` above `credit_limit * cap_bps / 10_000`.
+    ///
+    /// # Parameters
+    /// - `borrower`: The borrower whose cap to configure.
+    /// - `cap_bps`: Cap ratio in basis points (1–10_000). Pass 0 to remove the cap.
+    pub fn set_utilization_cap(env: Env, borrower: Address, cap_bps: u32) {
+        require_admin_auth(&env);
+        if cap_bps == 0 {
+            env.storage()
+                .instance()
+                .remove(&DataKey::UtilizationCapBps(borrower));
+        } else {
+            assert!(cap_bps <= 10_000, "cap_bps must be <= 10000");
+            env.storage()
+                .instance()
+                .set(&DataKey::UtilizationCapBps(borrower), &cap_bps);
+        }
+    }
+
+    /// Get the utilization cap in basis points for a borrower, if set.
+    pub fn get_utilization_cap(env: Env, borrower: Address) -> Option<u32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::UtilizationCapBps(borrower))
     }
 
     // ── Grace period policy ───────────────────────────────────────────────────
@@ -3799,5 +3848,153 @@ mod test_liquidity_error_codes {
         );
 
         client.repay_credit(&borrower, &200);
+    }
+}
+
+#[cfg(test)]
+mod test_utilization_cap {
+    use super::*;
+    use crate::test_helpers::MockLiquidityToken;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    fn setup_with_cap_env(
+        env: &Env,
+        credit_limit: i128,
+    ) -> (CreditClient<'_>, Address, MockLiquidityToken) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let borrower = Address::generate(env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(env, &contract_id);
+        client.init(&admin);
+        let liquidity = MockLiquidityToken::deploy(env);
+        liquidity.mint(&contract_id, credit_limit);
+        client.set_liquidity_token(&liquidity.address());
+        client.open_credit_line(&borrower, &credit_limit, &300_u32, &50_u32);
+        (client, borrower, liquidity)
+    }
+
+    #[test]
+    fn test_draw_within_utilization_cap_succeeds() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 1_000);
+        client.set_utilization_cap(&borrower, &8_000_u32);
+        client.draw_credit(&borrower, &800_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            800_i128
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds utilization cap")]
+    fn test_draw_exceeds_utilization_cap_reverts() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 1_000);
+        client.set_utilization_cap(&borrower, &8_000_u32);
+        client.draw_credit(&borrower, &801_i128);
+    }
+
+    #[test]
+    fn test_no_cap_allows_full_limit() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 1_000);
+        client.draw_credit(&borrower, &1_000_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            1_000_i128
+        );
+    }
+
+    #[test]
+    fn test_remove_cap_allows_full_limit() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 1_000);
+        client.set_utilization_cap(&borrower, &5_000_u32);
+        client.set_utilization_cap(&borrower, &0_u32);
+        assert!(client.get_utilization_cap(&borrower).is_none());
+        client.draw_credit(&borrower, &1_000_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            1_000_i128
+        );
+    }
+
+    #[test]
+    fn test_get_utilization_cap_returns_set_value() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 1_000);
+        assert!(client.get_utilization_cap(&borrower).is_none());
+        client.set_utilization_cap(&borrower, &7_500_u32);
+        assert_eq!(client.get_utilization_cap(&borrower), Some(7_500_u32));
+    }
+
+    #[test]
+    fn test_cap_at_100_percent_allows_full_limit() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 1_000);
+        client.set_utilization_cap(&borrower, &10_000_u32);
+        client.draw_credit(&borrower, &1_000_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            1_000_i128
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cap_bps must be <= 10000")]
+    fn test_set_cap_above_10000_reverts() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 1_000);
+        client.set_utilization_cap(&borrower, &10_001_u32);
+    }
+
+    #[test]
+    fn test_cap_is_per_borrower_independent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower_a = Address::generate(&env);
+        let borrower_b = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+        let liquidity = MockLiquidityToken::deploy(&env);
+        liquidity.mint(&contract_id, 2_000);
+        client.set_liquidity_token(&liquidity.address());
+        client.open_credit_line(&borrower_a, &1_000_i128, &300_u32, &50_u32);
+        client.open_credit_line(&borrower_b, &1_000_i128, &300_u32, &50_u32);
+        client.set_utilization_cap(&borrower_a, &5_000_u32);
+        client.draw_credit(&borrower_b, &1_000_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower_b).unwrap().utilized_amount,
+            1_000_i128
+        );
+        client.draw_credit(&borrower_a, &500_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower_a).unwrap().utilized_amount,
+            500_i128
+        );
+    }
+
+    #[test]
+    fn test_cap_boundary_exact_draw_succeeds() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 500);
+        client.set_utilization_cap(&borrower, &6_000_u32);
+        client.draw_credit(&borrower, &300_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            300_i128
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds utilization cap")]
+    fn test_cap_boundary_one_over_reverts() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 500);
+        client.set_utilization_cap(&borrower, &6_000_u32);
+        client.draw_credit(&borrower, &301_i128);
     }
 }
