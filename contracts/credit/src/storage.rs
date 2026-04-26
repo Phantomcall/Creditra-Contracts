@@ -13,10 +13,15 @@ pub enum DataKey {
     /// Does not affect repayments. Distinct from per-line `Suspended` status.
     DrawsFrozen,
     MaxDrawAmount,
+    /// Minimum interval in seconds required between successive draws for any borrower.
+    DrawMinIntervalSeconds,
+    /// Per-borrower last successful draw timestamp.
+    LastDrawTs(Address),
     /// Per-borrower block flag; when `true`, draw_credit is rejected.
     BlockedBorrower(Address),
-    /// Storage schema version marker. Set to `1` on init.
-    SchemaVersion,
+    /// Per-borrower max utilization ratio cap in basis points (e.g. 8000 = 80%).
+    /// When set, draw_credit enforces: utilized_amount <= credit_limit * cap_bps / 10_000.
+    UtilizationCapBps(Address),
 }
 
 pub fn admin_key(env: &Env) -> Symbol {
@@ -108,6 +113,38 @@ pub fn set_borrower_blocked(env: &Env, borrower: &Address, blocked: bool) {
     env.storage()
         .persistent()
         .set(&DataKey::BlockedBorrower(borrower.clone()), &blocked);
+}
+
+/// Get the configured minimum draw interval in seconds.
+pub fn get_draw_min_interval(env: &Env) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::DrawMinIntervalSeconds)
+}
+
+/// Set or clear the configured minimum draw interval in seconds.
+pub fn set_draw_min_interval(env: &Env, interval_seconds: u64) {
+    if interval_seconds == 0 {
+        env.storage().instance().remove(&DataKey::DrawMinIntervalSeconds);
+    } else {
+        env.storage()
+            .instance()
+            .set(&DataKey::DrawMinIntervalSeconds, &interval_seconds);
+    }
+}
+
+/// Get the last successful draw timestamp for a borrower.
+pub fn get_last_draw_ts(env: &Env, borrower: &Address) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::LastDrawTs(borrower.clone()))
+}
+
+/// Record the last successful draw timestamp for a borrower.
+pub fn set_last_draw_ts(env: &Env, borrower: &Address, ts: u64) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::LastDrawTs(borrower.clone()), &ts);
 }
 
 /// Check whether the protocol is paused.
